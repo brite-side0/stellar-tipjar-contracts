@@ -1,41 +1,67 @@
-/// Upgrade module — documents the upgrade mechanism and re-exports the
-/// types callers need to invoke `TipJarContract::upgrade`.
+use soroban_sdk::{symbol_short, BytesN, Env};
+
+use crate::{DataKey, TipJarError};
+
+/// Performs an admin-authorized WASM upgrade and bumps the on-chain version.
 ///
-/// # How Soroban upgrades work
-///
-/// `env.deployer().update_current_contract_wasm(new_wasm_hash)` atomically
-/// swaps the executing contract's WASM bytecode for the one identified by
-/// `new_wasm_hash` (which must already be uploaded to the network via
-/// `stellar contract upload`).  All instance and persistent storage entries
-/// are preserved by the host — no migration step is required for additive
-/// changes.
+/// # Authorization
+/// Requires auth from the stored `DataKey::Admin` address.
 ///
 /// # Upgrade flow
-///
-/// 1. Upload new WASM:
+/// 1. Upload new WASM and note the returned hash:
 ///    ```bash
-///    stellar contract upload --wasm target/wasm32v1-none/release/tipjar.wasm \
+///    stellar contract upload \
+///        --wasm target/wasm32v1-none/release/tipjar.wasm \
 ///        --source <admin-key> --network testnet
-///    # prints: <new_wasm_hash>
 ///    ```
-/// 2. Invoke upgrade (Admin only):
+/// 2. Invoke this function:
 ///    ```bash
 ///    stellar contract invoke --id <contract_id> \
 ///        --source <admin-key> --network testnet \
-///        -- upgrade --admin <admin_address> --new_wasm_hash <new_wasm_hash>
+///        -- upgrade --new_wasm_hash <hash>
 ///    ```
-/// 3. Verify:
+/// 3. Confirm the new version:
 ///    ```bash
-///    stellar contract invoke --id <contract_id> --network testnet \
-///        -- get_version
-///    # returns incremented version number
+///    stellar contract invoke --id <contract_id> --network testnet -- get_version
 ///    ```
 ///
-/// # Backward compatibility rules
+/// # Backward compatibility
+/// - Adding new `DataKey` variants or contract functions is always safe.
+/// - Changing the *type* of an existing key requires a migration function in
+///   the new WASM (see `migrations/upgrade_v1_to_v2.rs` for an example).
+/// - Removing a key variant orphans stored data; prefer deprecation.
 ///
-/// - Adding new `DataKey` variants is safe (old keys are unaffected).
-/// - Adding new contract functions is safe.
-/// - Removing or renaming existing `DataKey` variants will orphan stored data.
-/// - Changing the type of an existing `DataKey` value requires a migration
-///   function in the new WASM that reads the old layout and rewrites it.
-pub use soroban_sdk::BytesN;
+/// # Rollback
+/// Re-upload the previous WASM and call `upgrade` again with its hash.
+/// The version counter will continue incrementing — it records history,
+/// not a semantic version.
+pub fn upgrade(env: &Env, new_wasm_hash: BytesN<32>) {
+    // Admin-only gate.
+    let admin: soroban_sdk::Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .unwrap_or_else(|| soroban_sdk::panic_with_error!(env, TipJarError::Unauthorized));
+    admin.require_auth();
+
+    let new_version = get_version(env) + 1;
+
+    // Atomically swap the executing WASM.  Storage is preserved by the host.
+    env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+    // Persist the new version *after* the WASM swap so the new code sees it.
+    env.storage()
+        .instance()
+        .set(&DataKey::ContractVersion, &new_version);
+
+    env.events()
+        .publish((symbol_short!("upgraded"),), (new_version,));
+}
+
+/// Returns the current contract version (0 before the first upgrade).
+pub fn get_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::ContractVersion)
+        .unwrap_or(0)
+}

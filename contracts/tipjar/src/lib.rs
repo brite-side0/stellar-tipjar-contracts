@@ -203,6 +203,8 @@ pub enum DataKey {
     OffchainCondition(BytesN<32>),
     /// Most-recently computed dynamic fee in basis points.
     CurrentFeeBps,
+    /// Monotonically increasing contract version, incremented on each upgrade.
+    ContractVersion,
 }
 
 #[contracterror]
@@ -422,5 +424,18 @@ impl TipJarContract {
             .publish((symbol_short!("tip"), creator.clone()), (sender, net));
         env.events()
             .publish((symbol_short!("fee"), creator.clone()), (fee, fee_bps));
+    }
+
+    /// Upgrades the contract WASM to `new_wasm_hash`. Admin only.
+    ///
+    /// Increments the on-chain version and emits `("upgraded",)` with the new
+    /// version number.  All storage is preserved by the Soroban host.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        upgrade::upgrade(&env, new_wasm_hash);
+    }
+
+    /// Returns the current contract version (0 before the first upgrade).
+    pub fn get_version(env: Env) -> u32 {
+        upgrade::get_version(&env)
     }
 }
