@@ -87,6 +87,7 @@ pub struct TipRecord {
     pub timestamp: u64,
     pub refunded: bool,
     pub refund_requested: bool,
+    pub refund_approved: bool,
 }
 
 #[contracttype]
@@ -243,11 +244,16 @@ pub struct TipJarContract;
 #[contractimpl]
 impl TipJarContract {
     /// One-time setup to choose the administrator for the TipJar.
-    pub fn init(env: Env, admin: Address) {
+    pub fn init(env: Env, admin: Address, fee_basis_points: u32, refund_window_seconds: u64) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, TipJarError::AlreadyInitialized as u32);
         }
+        if fee_basis_points > 500 {
+            panic_with_error!(&env, TipJarError::FeeExceedsMaximum);
+        }
         env.storage().instance().put(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::FeeBasisPoints, &fee_basis_points);
+        env.storage().instance().set(&DataKey::RefundWindow, &refund_window_seconds);
     }
 
     /// Sets an off-chain condition flag that can later be referenced in
@@ -274,8 +280,9 @@ impl TipJarContract {
 
     /// Transfers `amount` of `token` from `sender` into escrow for `creator`.
     ///
+    /// Deducts the platform fee before crediting the creator. Returns the tip ID.
     /// Emits `("tip", creator)` with data `(sender, amount)`.
-    pub fn tip(env: Env, sender: Address, creator: Address, token: Address, amount: i128) {
+    pub fn tip(env: Env, sender: Address, creator: Address, token: Address, amount: i128) -> u64 {
         sender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
@@ -289,6 +296,17 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
         }
         token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let fee: i128 = (amount * fee_bp as i128) / 10000;
+        let creator_amount = amount - fee;
+
+        if fee > 0 {
+            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let new_fee_bal: i128 = env.storage().instance().get(&fee_key).unwrap_or(0) + fee;
+            env.storage().instance().set(&fee_key, &new_fee_bal);
+        }
+
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
         let existing_bal: i128 = env.storage().persistent().get(&bal_key)
             .unwrap_or_else(|| env.storage().instance().get(&bal_key).unwrap_or(0));
@@ -300,6 +318,7 @@ impl TipJarContract {
         let new_tot: i128 = existing_tot + amount;
         env.storage().persistent().set(&tot_key, &new_tot);
         env.events().publish((symbol_short!("tip"), creator.clone()), (sender, amount));
+        tip_id
     }
 
     /// Withdraws the full escrowed balance for `creator` in `token`.
