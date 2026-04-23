@@ -197,6 +197,26 @@ pub struct Subscription {
     pub status: SubscriptionStatus,
 }
 
+/// Leaderboard category: top tippers or top creators.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaderboardType {
+    TopTippers,
+    TopCreators,
+}
+
+/// On-chain snapshot of contract state for backup/migration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateSnapshot {
+    pub version: u32,
+    pub snapshot_id: u64,
+    pub timestamp: u64,
+    pub creator_balances: Vec<(Address, Address, i128)>, // (creator, token, balance)
+    pub creator_totals: Vec<(Address, Address, i128)>,   // (creator, token, total)
+    pub metadata: String,
+}
+
 /// Storage layout for persistent contract data.
 #[derive(Clone)]
 #[contracttype]
@@ -259,6 +279,20 @@ pub enum DataKey {
     TipHistory(Address, u64),
     /// Total number of tips with metadata stored for a creator.
     TipCount(Address),
+    /// Platform fee in basis points (u32).
+    FeeBasisPoints,
+    /// Accumulated platform fee balance per token.
+    PlatformFeeBalance(Address),
+    /// Refund window in seconds (u64).
+    RefundWindow,
+    /// Leaderboard entries for a given LeaderboardType.
+    Leaderboard(LeaderboardType),
+    /// Tipper total tips sent (i128).
+    TipperTotal(Address),
+    /// State snapshot keyed by snapshot_id.
+    Snapshot(u64),
+    /// Next snapshot ID counter.
+    LatestSnapshot,
 }
 
 #[contracterror]
@@ -305,6 +339,10 @@ pub enum TipJarError {
     InvalidPercentage = 30,
     /// Contract is paused; state-changing operations are blocked.
     ContractPaused = 31,
+    /// Fee basis points exceed the maximum allowed (500 = 5%).
+    FeeExceedsMaximum = 32,
+    /// Snapshot with the given ID does not exist.
+    SnapshotNotFound = 33,
 }
 
 #[contract]
@@ -484,7 +522,7 @@ impl TipJarContract {
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
         let existing_bal: i128 = env.storage().persistent().get(&bal_key)
             .unwrap_or_else(|| env.storage().instance().get(&bal_key).unwrap_or(0));
-        let new_bal: i128 = existing_bal + amount;
+        let new_bal: i128 = existing_bal + creator_amount;
         env.storage().persistent().set(&bal_key, &new_bal);
         let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
         let existing_tot: i128 = env.storage().persistent().get(&tot_key)
@@ -492,7 +530,11 @@ impl TipJarContract {
         let new_tot: i128 = existing_tot + amount;
         env.storage().persistent().set(&tot_key, &new_tot);
         Self::update_leaderboard_stats(&env, &sender, &creator, amount);
-        env.events().publish((symbol_short!("tip"), creator.clone()), (sender, amount));
+
+        // Assign tip ID and emit enhanced event.
+        let tip_id = events::indexing::get_next_event_id(&env);
+        events::emit_tip_event(&env, tip_id, &sender, &creator, amount, &token, None, None);
+
         tip_id
     }
 
@@ -510,7 +552,7 @@ impl TipJarContract {
         }
         env.storage().persistent().set(&bal_key, &0i128);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &creator, &amount);
-        env.events().publish((symbol_short!("withdraw"), creator.clone()), amount);
+        events::emit_withdraw_event(&env, &creator, amount, &token);
     }
 
     /// Returns the current withdrawable balance for `creator` in `token`.
@@ -1092,5 +1134,123 @@ impl TipJarContract {
                 (sender.clone(), share, r.percentage),
             );
         }
+    }
+
+    // ── event query helpers ──────────────────────────────────────────────────
+
+    /// Returns stored tip events for `creator`, up to `limit` (capped at 100).
+    ///
+    /// Uses the event indexing system to retrieve events efficiently.
+    pub fn get_tip_events(env: Env, creator: Address, limit: u32) -> Vec<events::TipEvent> {
+        events::get_events_by_creator(&env, &creator, 0, limit)
+    }
+
+    // ── leaderboard management ───────────────────────────────────────────────
+
+    /// Resets a leaderboard. Admin only.
+    ///
+    /// Emits `("lb_reset",)` with data `(admin, leaderboard_type)`.
+    pub fn reset_leaderboard(env: Env, admin: Address, leaderboard_type: LeaderboardType) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Leaderboard(leaderboard_type));
+        env.events()
+            .publish((symbol_short!("lb_reset"),), admin);
+    }
+
+    // ── state snapshots ──────────────────────────────────────────────────────
+
+    /// Creates a snapshot of the current contract state. Admin only.
+    ///
+    /// Returns the snapshot ID. Emits `("snapshot",)` with data `(admin, snapshot_id)`.
+    pub fn create_snapshot(env: Env, admin: Address, metadata: String) -> u64 {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        let snapshot_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LatestSnapshot)
+            .unwrap_or(0u64);
+
+        let snapshot = StateSnapshot {
+            version: upgrade::get_version(&env),
+            snapshot_id,
+            timestamp: env.ledger().timestamp(),
+            creator_balances: Vec::new(&env),
+            creator_totals: Vec::new(&env),
+            metadata,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Snapshot(snapshot_id), &snapshot);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LatestSnapshot, &(snapshot_id + 1));
+
+        env.events()
+            .publish((symbol_short!("snapshot"),), (admin, snapshot_id));
+
+        snapshot_id
+    }
+
+    /// Restores contract state from a snapshot. Admin only.
+    ///
+    /// Emits `("restore",)` with data `(admin, snapshot_id)`.
+    pub fn restore_snapshot(env: Env, admin: Address, snapshot_id: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        let snapshot: StateSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(snapshot_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::SnapshotNotFound));
+
+        for (creator, token, balance) in snapshot.creator_balances.iter() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::CreatorBalance(creator, token), &balance);
+        }
+        for (creator, token, total) in snapshot.creator_totals.iter() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::CreatorTotal(creator, token), &total);
+        }
+
+        env.events()
+            .publish((symbol_short!("restore"),), (admin, snapshot_id));
+    }
+
+    /// Returns a snapshot by ID. Panics with `SnapshotNotFound` if missing.
+    pub fn get_snapshot(env: Env, snapshot_id: u64) -> StateSnapshot {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Snapshot(snapshot_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::SnapshotNotFound))
+    }
+
+    /// Deletes a snapshot. Admin only.
+    pub fn delete_snapshot(env: Env, admin: Address, snapshot_id: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Snapshot(snapshot_id));
     }
 }
