@@ -84,6 +84,7 @@ pub struct TipRecord {
     pub timestamp: u64,
     pub refunded: bool,
     pub refund_requested: bool,
+    pub refund_approved: bool,
 }
 
 #[contracttype]
@@ -198,6 +199,12 @@ pub enum DataKey {
     TipCounter,
     /// Off-chain oracle approval flag keyed by condition ID.
     OffchainCondition(BytesN<32>),
+    /// Platform fee in basis points (100 = 1%, max 500 = 5%).
+    FeeBasisPoints,
+    /// Accumulated platform fees per token.
+    PlatformFeeBalance(Address),
+    /// Refund window duration in seconds.
+    RefundWindow,
 }
 
 #[contracterror]
@@ -226,6 +233,11 @@ pub enum TipJarError {
     NftNotConfigured = 20,
     SwapFailed = 21,
     ConditionFailed = 22,
+    FeeExceedsMaximum = 23,
+    AlreadyRefunded = 24,
+    RefundWindowExpired = 25,
+    RefundNotApproved = 26,
+    TipNotFound = 27,
 }
 
 #[contract]
@@ -234,11 +246,16 @@ pub struct TipJarContract;
 #[contractimpl]
 impl TipJarContract {
     /// One-time setup to choose the administrator for the TipJar.
-    pub fn init(env: Env, admin: Address) {
+    pub fn init(env: Env, admin: Address, fee_basis_points: u32, refund_window_seconds: u64) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, TipJarError::AlreadyInitialized as u32);
         }
+        if fee_basis_points > 500 {
+            panic_with_error!(&env, TipJarError::FeeExceedsMaximum);
+        }
         env.storage().instance().put(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::FeeBasisPoints, &fee_basis_points);
+        env.storage().instance().set(&DataKey::RefundWindow, &refund_window_seconds);
     }
 
     /// Sets an off-chain condition flag that can later be referenced in
@@ -265,8 +282,9 @@ impl TipJarContract {
 
     /// Transfers `amount` of `token` from `sender` into escrow for `creator`.
     ///
+    /// Deducts the platform fee before crediting the creator. Returns the tip ID.
     /// Emits `("tip", creator)` with data `(sender, amount)`.
-    pub fn tip(env: Env, sender: Address, creator: Address, token: Address, amount: i128) {
+    pub fn tip(env: Env, sender: Address, creator: Address, token: Address, amount: i128) -> u64 {
         sender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
@@ -280,13 +298,41 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
         }
         token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let fee: i128 = (amount * fee_bp as i128) / 10000;
+        let creator_amount = amount - fee;
+
+        if fee > 0 {
+            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let new_fee_bal: i128 = env.storage().instance().get(&fee_key).unwrap_or(0) + fee;
+            env.storage().instance().set(&fee_key, &new_fee_bal);
+        }
+
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
-        let new_bal: i128 = env.storage().instance().get(&bal_key).unwrap_or(0) + amount;
+        let new_bal: i128 = env.storage().instance().get(&bal_key).unwrap_or(0) + creator_amount;
         env.storage().instance().set(&bal_key, &new_bal);
         let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
-        let new_tot: i128 = env.storage().instance().get(&tot_key).unwrap_or(0) + amount;
+        let new_tot: i128 = env.storage().instance().get(&tot_key).unwrap_or(0) + creator_amount;
         env.storage().instance().set(&tot_key, &new_tot);
+
+        let tip_id: u64 = env.storage().instance().get(&DataKey::TipCounter).unwrap_or(0);
+        let record = TipRecord {
+            id: tip_id,
+            sender: sender.clone(),
+            creator: creator.clone(),
+            token: token.clone(),
+            amount,
+            timestamp: env.ledger().timestamp(),
+            refunded: false,
+            refund_requested: false,
+            refund_approved: false,
+        };
+        env.storage().instance().set(&DataKey::TipRecord(tip_id), &record);
+        env.storage().instance().set(&DataKey::TipCounter, &(tip_id + 1));
+
         env.events().publish((symbol_short!("tip"), creator.clone()), (sender, amount));
+        tip_id
     }
 
     /// Withdraws the full escrowed balance for `creator` in `token`.
@@ -351,5 +397,98 @@ impl TipJarContract {
         );
 
         true
+    }
+
+    /// Withdraws accumulated platform fees for `token` to the admin. Admin only.
+    pub fn withdraw_platform_fees(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        let fee_key = DataKey::PlatformFeeBalance(token.clone());
+        let amount: i128 = env.storage().instance().get(&fee_key).unwrap_or(0);
+        if amount == 0 {
+            panic_with_error!(&env, TipJarError::NothingToWithdraw);
+        }
+        env.storage().instance().set(&fee_key, &0i128);
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &admin, &amount);
+    }
+
+    /// Updates the platform fee. Admin only. Max 500 basis points (5%).
+    pub fn update_fee(env: Env, admin: Address, fee_basis_points: u32) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if fee_basis_points > 500 {
+            panic_with_error!(&env, TipJarError::FeeExceedsMaximum);
+        }
+        env.storage().instance().set(&DataKey::FeeBasisPoints, &fee_basis_points);
+    }
+
+    /// Requests a refund for a tip within the refund window. Sender only.
+    pub fn request_refund(env: Env, sender: Address, tip_id: u64) {
+        sender.require_auth();
+        let mut record: TipRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::TipRecord(tip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::TipNotFound));
+        if record.sender != sender {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if record.refunded {
+            panic_with_error!(&env, TipJarError::AlreadyRefunded);
+        }
+        let window: u64 = env.storage().instance().get(&DataKey::RefundWindow).unwrap_or(0);
+        let now = env.ledger().timestamp();
+        if now > record.timestamp + window {
+            panic_with_error!(&env, TipJarError::RefundWindowExpired);
+        }
+        record.refund_requested = true;
+        env.storage().instance().set(&DataKey::TipRecord(tip_id), &record);
+        Self::process_refund(&env, &mut record, tip_id);
+    }
+
+    /// Approves a refund for a tip after the window has expired. Creator only.
+    pub fn approve_refund(env: Env, creator: Address, tip_id: u64) {
+        creator.require_auth();
+        let mut record: TipRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::TipRecord(tip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::TipNotFound));
+        if record.creator != creator {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if record.refunded {
+            panic_with_error!(&env, TipJarError::AlreadyRefunded);
+        }
+        record.refund_approved = true;
+        env.storage().instance().set(&DataKey::TipRecord(tip_id), &record);
+        Self::process_refund(&env, &mut record, tip_id);
+    }
+
+    /// Processes a refund: transfers creator_amount back to sender and updates balances.
+    fn process_refund(env: &Env, record: &mut TipRecord, tip_id: u64) {
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let fee: i128 = (record.amount * fee_bp as i128) / 10000;
+        let creator_amount = record.amount - fee;
+
+        let bal_key = DataKey::CreatorBalance(record.creator.clone(), record.token.clone());
+        let bal: i128 = env.storage().instance().get(&bal_key).unwrap_or(0);
+        let new_bal = if bal >= creator_amount { bal - creator_amount } else { 0 };
+        env.storage().instance().set(&bal_key, &new_bal);
+
+        token::Client::new(env, &record.token).transfer(
+            &env.current_contract_address(),
+            &record.sender,
+            &creator_amount,
+        );
+
+        record.refunded = true;
+        env.storage().instance().set(&DataKey::TipRecord(tip_id), record);
     }
 }
