@@ -36,6 +36,24 @@ pub mod conditions;
 // Dynamic fee adjustment
 pub mod fees;
 
+/// A tip record that includes an optional memo and timestamp.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipWithMemo {
+    pub sender: Address,
+    pub amount: i128,
+    pub memo: Option<String>,
+    pub timestamp: u64,
+}
+
+/// Combined creator stats stored in a single persistent entry to reduce storage reads/writes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatorStats {
+    pub balance: i128,
+    pub total: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TipWithMessage {
@@ -75,6 +93,16 @@ pub struct LockedTip {
     pub token: Address,
     pub amount: i128,
     pub unlock_timestamp: u64,
+}
+
+/// Metadata stored on-chain for each tip with an optional message.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipMetadata {
+    pub sender: Address,
+    pub amount: i128,
+    pub message: Option<String>,
+    pub timestamp: u64,
 }
 
 /// Internal record of a tip for refund tracking.
@@ -221,6 +249,17 @@ pub struct Subscription {
     pub status: SubscriptionStatus,
 }
 
+/// A time-locked tip that can only be withdrawn after `unlock_time`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeLock {
+    pub sender: Address,
+    pub creator: Address,
+    pub amount: i128,
+    pub unlock_time: u64,
+    pub cancelled: bool,
+}
+
 /// Storage layout for persistent contract data.
 #[derive(Clone)]
 #[contracttype]
@@ -279,16 +318,10 @@ pub enum DataKey {
     Subscription(Address, Address),
     /// Human-readable reason stored when the contract is paused.
     PauseReason,
-    /// Per-creator withdrawal limit state (token-agnostic).
-    WithdrawalLimits(Address),
-    /// Default withdrawal limits applied when no per-creator limits are set.
-    DefaultWithdrawalLimits,
-    /// Matching campaign by campaign ID.
-    MatchingCampaign(u64),
-    /// Global matching campaign counter.
-    CampaignCounter,
-    /// Campaign IDs indexed under a creator.
-    CreatorCampaigns(Address),
+    /// TipMetadata keyed by (creator, tip_index).
+    TipHistory(Address, u64),
+    /// Total number of tips with metadata stored for a creator.
+    TipCount(Address),
 }
 
 #[contracterror]
@@ -335,14 +368,14 @@ pub enum TipJarError {
     InvalidPercentage = 30,
     /// Contract is paused; state-changing operations are blocked.
     ContractPaused = 31,
-    /// Withdrawal would exceed the creator's daily limit.
-    DailyLimitExceeded = 32,
-    /// Cooldown period since the last withdrawal has not elapsed.
-    CooldownActive = 33,
-    /// No matching campaign exists for the given campaign ID.
-    CampaignNotFound = 34,
-    /// Campaign is still active; sponsor cannot withdraw unused funds yet.
-    CampaignStillActive = 35,
+    /// Fee exceeds the maximum allowed (500 bps).
+    FeeExceedsMaximum = 32,
+    /// Time-lock record not found.
+    LockNotFound = 33,
+    /// Unlock time has not been reached yet.
+    NotUnlocked = 34,
+    /// Time-lock has already been cancelled.
+    LockCancelled = 35,
 }
 
 #[contract]
@@ -420,12 +453,12 @@ impl TipJarContract {
     /// One-time setup to choose the administrator for the TipJar.
     pub fn init(env: Env, admin: Address, fee_basis_points: u32, refund_window_seconds: u64) {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, TipJarError::AlreadyInitialized as u32);
+            panic_with_error!(&env, TipJarError::AlreadyInitialized);
         }
         if fee_basis_points > 500 {
             panic_with_error!(&env, TipJarError::FeeExceedsMaximum);
         }
-        env.storage().instance().put(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::FeeBasisPoints, &fee_basis_points);
         env.storage().instance().set(&DataKey::RefundWindow, &refund_window_seconds);
     }
@@ -495,6 +528,7 @@ impl TipJarContract {
     /// Deducts the platform fee before crediting the creator. Returns the tip ID.
     /// Emits `("tip", creator)` with data `(sender, amount)`.
     pub fn tip(env: Env, sender: Address, creator: Address, token: Address, amount: i128) -> u64 {
+        Self::require_not_paused(&env);
         sender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
@@ -507,31 +541,43 @@ impl TipJarContract {
         if !whitelisted {
             panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
         }
-        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
 
         let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
-        let fee: i128 = (amount * fee_bp as i128) / 10000;
-        let creator_amount = amount - fee;
+        let fee: i128 = (amount * fee_bp as i128) / 10_000;
+        let creator_amount = amount.checked_sub(fee).unwrap_or(0);
 
+        // ── state updates before external call (CEI pattern) ─────────────────
         if fee > 0 {
             let fee_key = DataKey::PlatformFeeBalance(token.clone());
-            let new_fee_bal: i128 = env.storage().instance().get(&fee_key).unwrap_or(0) + fee;
+            let new_fee_bal: i128 = env
+                .storage()
+                .instance()
+                .get(&fee_key)
+                .unwrap_or(0)
+                .checked_add(fee)
+                .expect("fee overflow");
             env.storage().instance().set(&fee_key, &new_fee_bal);
         }
 
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
-        let existing_bal: i128 = env.storage().persistent().get(&bal_key)
-            .unwrap_or_else(|| env.storage().instance().get(&bal_key).unwrap_or(0));
-        let new_bal: i128 = existing_bal + amount;
+        let existing_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        let new_bal: i128 = existing_bal.checked_add(creator_amount).expect("balance overflow");
         env.storage().persistent().set(&bal_key, &new_bal);
+
         let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
-        let existing_tot: i128 = env.storage().persistent().get(&tot_key)
-            .unwrap_or_else(|| env.storage().instance().get(&tot_key).unwrap_or(0));
-        let new_tot: i128 = existing_tot + amount;
+        let existing_tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
+        let new_tot: i128 = existing_tot.checked_add(creator_amount).expect("total overflow");
         env.storage().persistent().set(&tot_key, &new_tot);
-        Self::update_leaderboard_stats(&env, &sender, &creator, amount);
-        env.events().publish((symbol_short!("tip"), creator.clone()), (sender, amount));
-        Self::apply_matching_campaigns(&env, &creator, &token, amount);
+
+        let tip_id: u64 = env.storage().instance().get(&DataKey::TipCounter).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TipCounter, &(tip_id + 1));
+
+        Self::update_leaderboard_stats(&env, &sender, &creator, creator_amount);
+
+        // ── external call last ───────────────────────────────────────────────
+        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+
+        env.events().publish((symbol_short!("tip"), creator.clone()), (sender, creator_amount));
         tip_id
     }
 
@@ -719,12 +765,14 @@ impl TipJarContract {
         );
 
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
-        let new_bal: i128 = env.storage().instance().get(&bal_key).unwrap_or(0) + net;
-        env.storage().instance().set(&bal_key, &new_bal);
+        let new_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0)
+            .checked_add(net).expect("balance overflow");
+        env.storage().persistent().set(&bal_key, &new_bal);
 
         let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
-        let new_tot: i128 = env.storage().instance().get(&tot_key).unwrap_or(0) + net;
-        env.storage().instance().set(&tot_key, &new_tot);
+        let new_tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0)
+            .checked_add(net).expect("total overflow");
+        env.storage().persistent().set(&tot_key, &new_tot);
 
         env.events()
             .publish((symbol_short!("tip"), creator.clone()), (sender, net));
@@ -907,6 +955,158 @@ impl TipJarContract {
             .get(&DataKey::Subscription(subscriber, creator))
     }
 
+    /// Like `tip`, but stores an optional on-chain message and metadata.
+    ///
+    /// `message` is limited to 200 Unicode scalar values (character count, not
+    /// byte count) so that emoji and multi-byte characters are treated fairly.
+    /// Panics with `TipJarError::MessageTooLong` when the limit is exceeded.
+    ///
+    /// Metadata is stored in persistent storage under `TipHistory(creator, index)`
+    /// and the per-creator counter `TipCount(creator)` is incremented.
+    ///
+    /// Emits `("tip_msg", creator)` with data `(sender, amount, message)`.
+    pub fn tip_with_message(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        message: Option<String>,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+
+        // Validate message length by character count (not bytes) to support emoji.
+        if let Some(ref msg) = message {
+            // Soroban String stores raw bytes; convert to a &str slice for char counting.
+            let bytes = msg.to_string();
+            let char_count = bytes.chars().count();
+            if char_count > 200 {
+                panic_with_error!(&env, TipJarError::MessageTooLong);
+            }
+        }
+
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let fee_bp: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBasisPoints)
+            .unwrap_or(0);
+        let fee: i128 = (amount * fee_bp as i128) / 10_000;
+        let creator_amount = amount - fee;
+
+        if fee > 0 {
+            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let new_fee_bal: i128 =
+                env.storage().instance().get(&fee_key).unwrap_or(0) + fee;
+            env.storage().instance().set(&fee_key, &new_fee_bal);
+        }
+
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let existing_bal: i128 = env
+            .storage()
+            .persistent()
+            .get(&bal_key)
+            .unwrap_or_else(|| env.storage().instance().get(&bal_key).unwrap_or(0));
+        env.storage()
+            .persistent()
+            .set(&bal_key, &(existing_bal + creator_amount));
+
+        let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
+        let existing_tot: i128 = env
+            .storage()
+            .persistent()
+            .get(&tot_key)
+            .unwrap_or_else(|| env.storage().instance().get(&tot_key).unwrap_or(0));
+        env.storage()
+            .persistent()
+            .set(&tot_key, &(existing_tot + amount));
+
+        Self::update_leaderboard_stats(&env, &sender, &creator, amount);
+
+        // Store metadata and increment tip count.
+        let count_key = DataKey::TipCount(creator.clone());
+        let tip_index: u64 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0u64);
+
+        let timestamp = env.ledger().timestamp();
+        let metadata = TipMetadata {
+            sender: sender.clone(),
+            amount,
+            message: message.clone(),
+            timestamp,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::TipHistory(creator.clone(), tip_index), &metadata);
+        env.storage()
+            .persistent()
+            .set(&count_key, &(tip_index + 1));
+
+        env.events().publish(
+            (symbol_short!("tip_msg"), creator.clone()),
+            (sender, amount, message),
+        );
+
+        tip_index
+    }
+
+    /// Returns the most recent tips (with metadata) for `creator`, newest first.
+    ///
+    /// `limit` is capped at 100 to bound storage reads.
+    pub fn get_tip_history(env: Env, creator: Address, limit: u32) -> Vec<TipMetadata> {
+        let count_key = DataKey::TipCount(creator.clone());
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0u64);
+
+        let cap = if limit > 100 { 100 } else { limit } as u64;
+        let mut result = Vec::new(&env);
+
+        if total == 0 {
+            return result;
+        }
+
+        // Iterate from newest (total-1) down to oldest, up to `cap` entries.
+        let mut idx = total;
+        let mut fetched: u64 = 0;
+        while idx > 0 && fetched < cap {
+            idx -= 1;
+            if let Some(meta) = env
+                .storage()
+                .persistent()
+                .get::<_, TipMetadata>(&DataKey::TipHistory(creator.clone(), idx))
+            {
+                result.push_back(meta);
+                fetched += 1;
+            }
+        }
+
+        result
+    }
+
     /// Splits a single tip among multiple recipients proportionally.
     ///
     /// `recipients` must contain 2–10 entries whose `percentage` values (basis
@@ -983,306 +1183,248 @@ impl TipJarContract {
         }
     }
 
-    // ── withdrawal limits ────────────────────────────────────────────────────
+    // ── RBAC ─────────────────────────────────────────────────────────────────
 
-    /// Checks and updates withdrawal limits for `creator`. Panics if exceeded.
-    fn check_and_update_withdrawal_limits(env: &Env, creator: &Address, amount: i128) {
-        let mut limits: WithdrawalLimits = env
-            .storage()
-            .persistent()
-            .get(&DataKey::WithdrawalLimits(creator.clone()))
-            .or_else(|| env.storage().instance().get(&DataKey::DefaultWithdrawalLimits))
-            .unwrap_or(WithdrawalLimits {
-                daily_limit: 0,
-                cooldown_seconds: 0,
-                last_withdrawal: 0,
-                withdrawn_today: 0,
-                day_start: 0,
-            });
-
-        // 0 means unlimited / no cooldown.
-        if limits.daily_limit == 0 && limits.cooldown_seconds == 0 {
-            return;
-        }
-
-        let now = env.ledger().timestamp();
-
-        if limits.cooldown_seconds > 0 && limits.last_withdrawal > 0 {
-            if now - limits.last_withdrawal < limits.cooldown_seconds {
-                panic_with_error!(env, TipJarError::CooldownActive);
-            }
-        }
-
-        if limits.daily_limit > 0 {
-            const DAY: u64 = 86_400;
-            if now - limits.day_start >= DAY {
-                limits.withdrawn_today = 0;
-                limits.day_start = now;
-            }
-            if limits.withdrawn_today + amount > limits.daily_limit {
-                panic_with_error!(env, TipJarError::DailyLimitExceeded);
-            }
-            limits.withdrawn_today += amount;
-        }
-
-        limits.last_withdrawal = now;
-        env.storage()
-            .persistent()
-            .set(&DataKey::WithdrawalLimits(creator.clone()), &limits);
-    }
-
-    /// Sets the default withdrawal limits applied to all creators without custom limits.
-    ///
-    /// Pass `daily_limit = 0` for unlimited and `cooldown_seconds = 0` for no cooldown.
-    /// Admin only.
-    pub fn set_default_withdrawal_limits(
-        env: Env,
-        admin: Address,
-        daily_limit: i128,
-        cooldown_seconds: u64,
-    ) {
+    /// Grants `role` to `user`. Caller must be the stored admin.
+    pub fn grant_role(env: Env, admin: Address, user: Address, role: Role) {
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
-        let limits = WithdrawalLimits {
-            daily_limit,
-            cooldown_seconds,
-            last_withdrawal: 0,
-            withdrawn_today: 0,
-            day_start: 0,
-        };
-        env.storage()
-            .instance()
-            .set(&DataKey::DefaultWithdrawalLimits, &limits);
-    }
-
-    /// Sets custom withdrawal limits for a specific creator. Admin only.
-    pub fn set_creator_withdrawal_limits(
-        env: Env,
-        admin: Address,
-        creator: Address,
-        daily_limit: i128,
-        cooldown_seconds: u64,
-    ) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin {
-            panic_with_error!(&env, TipJarError::Unauthorized);
-        }
-        let limits = WithdrawalLimits {
-            daily_limit,
-            cooldown_seconds,
-            last_withdrawal: 0,
-            withdrawn_today: 0,
-            day_start: 0,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::WithdrawalLimits(creator), &limits);
-    }
-
-    /// Emergency withdrawal bypassing limits. Admin only.
-    ///
-    /// Emits `("emg_wdraw", creator)` with data `amount`.
-    pub fn emergency_withdraw(env: Env, admin: Address, creator: Address, token: Address) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin {
-            panic_with_error!(&env, TipJarError::Unauthorized);
-        }
-        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
-        let amount: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
-        if amount == 0 {
-            panic_with_error!(&env, TipJarError::NothingToWithdraw);
-        }
-        env.storage().persistent().set(&bal_key, &0i128);
-        token::Client::new(&env, &token)
-            .transfer(&env.current_contract_address(), &creator, &amount);
-        env.events()
-            .publish((symbol_short!("emg_wdraw"), creator), amount);
-    }
-
-    // ── matching campaigns ───────────────────────────────────────────────────
-
-    /// Creates a time-boxed matching campaign funded by `sponsor`.
-    ///
-    /// `match_ratio` is in basis points (100 = 1:1, 200 = 2:1).
-    /// `duration_days` sets how long the campaign runs from now.
-    ///
-    /// Transfers `budget` from sponsor into contract escrow.
-    /// Emits `("campaign", sponsor)` with data `(creator, campaign_id, budget)`.
-    /// Returns the new campaign ID.
-    pub fn create_matching_campaign(
-        env: Env,
-        sponsor: Address,
-        creator: Address,
-        token: Address,
-        match_ratio: u32,
-        budget: i128,
-        duration_days: u32,
-    ) -> u64 {
-        Self::require_not_paused(&env);
-        sponsor.require_auth();
-        if budget <= 0 {
-            panic_with_error!(&env, TipJarError::InvalidAmount);
-        }
-        if match_ratio == 0 {
-            panic_with_error!(&env, TipJarError::InvalidMatchRatio);
-        }
-
-        token::Client::new(&env, &token)
-            .transfer(&sponsor, &env.current_contract_address(), &budget);
-
-        let campaign_id: u64 = env
+        env.storage().persistent().set(&DataKey::UserRole(user.clone()), &role);
+        let mut members: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::CampaignCounter)
-            .unwrap_or(0u64);
-
-        let now = env.ledger().timestamp();
-        let campaign = MatchingCampaign {
-            sponsor: sponsor.clone(),
-            creator: creator.clone(),
-            token,
-            match_ratio,
-            total_budget: budget,
-            remaining_budget: budget,
-            start_time: now,
-            end_time: now + (duration_days as u64 * 86_400),
-            active: true,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::MatchingCampaign(campaign_id), &campaign);
-        env.storage()
-            .persistent()
-            .set(&DataKey::CampaignCounter, &(campaign_id + 1));
-
-        let mut ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CreatorCampaigns(creator.clone()))
+            .get(&DataKey::RoleMembers(role.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        ids.push_back(campaign_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::CreatorCampaigns(creator.clone()), &ids);
-
-        env.events().publish(
-            (symbol_short!("campaign"), sponsor),
-            (creator, campaign_id, budget),
-        );
-
-        campaign_id
-    }
-
-    /// Applies active matching campaigns when a tip is made to `creator`.
-    ///
-    /// Called internally by `tip`. Adds matched amounts to the creator's balance.
-    fn apply_matching_campaigns(env: &Env, creator: &Address, token: &Address, tip_amount: i128) {
-        let ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CreatorCampaigns(creator.clone()))
-            .unwrap_or_else(|| Vec::new(env));
-
-        let now = env.ledger().timestamp();
-
-        for campaign_id in ids.iter() {
-            let key = DataKey::MatchingCampaign(campaign_id);
-            let mut campaign: MatchingCampaign = match env.storage().persistent().get(&key) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            if !campaign.active
-                || now < campaign.start_time
-                || now > campaign.end_time
-                || campaign.remaining_budget <= 0
-                || &campaign.token != token
-            {
-                continue;
-            }
-
-            let match_amount = (tip_amount * campaign.match_ratio as i128) / 100;
-            let actual_match = match_amount.min(campaign.remaining_budget);
-            if actual_match <= 0 {
-                continue;
-            }
-
-            campaign.remaining_budget -= actual_match;
-            env.storage().persistent().set(&key, &campaign);
-
-            let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
-            let bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
-            env.storage().persistent().set(&bal_key, &(bal + actual_match));
-
-            env.events().publish(
-                (symbol_short!("match"), creator.clone()),
-                (campaign_id, actual_match),
-            );
+        if !members.contains(&user) {
+            members.push_back(user.clone());
+            env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &members);
         }
+        env.events().publish((symbol_short!("role_grt"),), (user, role));
     }
 
-    /// Allows a sponsor to withdraw unused funds from an expired campaign.
-    ///
-    /// Emits `("camp_wdraw", sponsor)` with data `(campaign_id, amount)`.
-    pub fn withdraw_campaign_funds(env: Env, sponsor: Address, campaign_id: u64) {
-        sponsor.require_auth();
-        let key = DataKey::MatchingCampaign(campaign_id);
-        let mut campaign: MatchingCampaign = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::CampaignNotFound));
-
-        if campaign.sponsor != sponsor {
+    /// Revokes any role from `user`. Caller must be the stored admin.
+    pub fn revoke_role(env: Env, admin: Address, user: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
-        if env.ledger().timestamp() <= campaign.end_time {
-            panic_with_error!(&env, TipJarError::CampaignStillActive);
-        }
-
-        let refund = campaign.remaining_budget;
-        if refund > 0 {
-            token::Client::new(&env, &campaign.token)
-                .transfer(&env.current_contract_address(), &sponsor, &refund);
-            campaign.remaining_budget = 0;
-        }
-        campaign.active = false;
-        env.storage().persistent().set(&key, &campaign);
-
-        env.events().publish(
-            (symbol_short!("camp_wdraw"), sponsor),
-            (campaign_id, refund),
-        );
-    }
-
-    /// Returns all active campaigns for `creator`.
-    pub fn get_active_campaigns(env: Env, creator: Address) -> Vec<MatchingCampaign> {
-        let ids: Vec<u64> = env
+        if let Some(role) = env
             .storage()
             .persistent()
-            .get(&DataKey::CreatorCampaigns(creator))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let now = env.ledger().timestamp();
-        let mut result = Vec::new(&env);
-
-        for campaign_id in ids.iter() {
-            if let Some(c) = env
+            .get::<DataKey, Role>(&DataKey::UserRole(user.clone()))
+        {
+            env.storage().persistent().remove(&DataKey::UserRole(user.clone()));
+            let mut members: Vec<Address> = env
                 .storage()
                 .persistent()
-                .get::<_, MatchingCampaign>(&DataKey::MatchingCampaign(campaign_id))
+                .get(&DataKey::RoleMembers(role.clone()))
+                .unwrap_or_else(|| Vec::new(&env));
+            members.retain(|a| a != user);
+            env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &members);
+            env.events().publish((symbol_short!("role_rev"),), (user, role));
+        }
+    }
+
+    /// Returns `true` if `user` holds `role`.
+    pub fn has_role(env: Env, user: Address, role: Role) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Role>(&DataKey::UserRole(user))
+            .map(|r| r == role)
+            .unwrap_or(false)
+    }
+
+    /// Internal helper — panics with `Unauthorized` if `user` does not hold `role`.
+    #[allow(dead_code)]
+    fn require_role(env: &Env, user: &Address, role: Role) {
+        let stored: Option<Role> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserRole(user.clone()));
+        if stored != Some(role) {
+            panic_with_error!(env, TipJarError::Unauthorized);
+        }
+    }
+
+    /// Returns all addresses that currently hold `role`.
+    pub fn get_role_members(env: Env, role: Role) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoleMembers(role))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── time-locked tips ──────────────────────────────────────────────────────
+
+    /// Creates a time-locked tip for a specific `token`. Tokens are transferred
+    /// immediately into escrow but can only be withdrawn by `creator` after `unlock_time`.
+    ///
+    /// Returns the lock ID.
+    /// Emits `("lock", creator)` with data `(sender, amount, unlock_time, lock_id)`.
+    pub fn tip_time_locked(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        unlock_time: u64,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        if unlock_time <= env.ledger().timestamp() {
+            panic_with_error!(&env, TipJarError::InvalidUnlockTime);
+        }
+
+        // State updates before external call (CEI).
+        let lock_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextLockId)
+            .unwrap_or(0);
+        let time_lock = TimeLock {
+            sender: sender.clone(),
+            creator: creator.clone(),
+            amount,
+            unlock_time,
+            cancelled: false,
+        };
+        env.storage().persistent().set(&DataKey::TimeLock(lock_id), &time_lock);
+        env.storage().persistent().set(&DataKey::NextLockId, &(lock_id + 1));
+
+        let mut creator_locks: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorLocks(creator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        creator_locks.push_back(lock_id);
+        env.storage().persistent().set(&DataKey::CreatorLocks(creator.clone()), &creator_locks);
+
+        // External call last.
+        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+
+        env.events().publish(
+            (symbol_short!("lock"), creator),
+            (sender, amount, unlock_time, lock_id),
+        );
+        lock_id
+    }
+
+    /// Withdraws a time-locked tip after its unlock time. Only `creator` may call.
+    ///
+    /// Emits `("unlock", creator)` with data `(amount, lock_id)`.
+    pub fn withdraw_time_locked(env: Env, creator: Address, token: Address, lock_id: u64) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let time_lock: TimeLock = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimeLock(lock_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockNotFound));
+
+        if time_lock.creator != creator {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if time_lock.cancelled {
+            panic_with_error!(&env, TipJarError::LockCancelled);
+        }
+        if env.ledger().timestamp() < time_lock.unlock_time {
+            panic_with_error!(&env, TipJarError::NotUnlocked);
+        }
+
+        // State update before external call (CEI).
+        env.storage().persistent().remove(&DataKey::TimeLock(lock_id));
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &creator,
+            &time_lock.amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("unlock"), creator),
+            (time_lock.amount, lock_id),
+        );
+    }
+
+    /// Cancels a time-locked tip and refunds the sender. Only the original sender may call.
+    ///
+    /// Emits `("lk_cncl", sender)` with data `(amount, lock_id)`.
+    pub fn cancel_time_lock(env: Env, sender: Address, token: Address, lock_id: u64) {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+
+        let mut time_lock: TimeLock = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimeLock(lock_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockNotFound));
+
+        if time_lock.sender != sender {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if time_lock.cancelled {
+            panic_with_error!(&env, TipJarError::LockCancelled);
+        }
+
+        // State update before external call (CEI).
+        time_lock.cancelled = true;
+        env.storage().persistent().set(&DataKey::TimeLock(lock_id), &time_lock);
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &sender,
+            &time_lock.amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("lk_cncl"), sender),
+            (time_lock.amount, lock_id),
+        );
+    }
+
+    /// Returns all time-lock records for `creator`.
+    pub fn get_time_locks(env: Env, creator: Address) -> Vec<TimeLock> {
+        let lock_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorLocks(creator))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut locks = Vec::new(&env);
+        for lock_id in lock_ids.iter() {
+            if let Some(lock) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TimeLock>(&DataKey::TimeLock(lock_id))
             {
-                if c.active && now <= c.end_time {
-                    result.push_back(c);
-                }
+                locks.push_back(lock);
             }
         }
-        result
+        locks
+    }
+
+    // ── upgrade / migration ───────────────────────────────────────────────────
+
+    /// Runs any data migration needed after an upgrade. Admin only.
+    ///
+    /// Match on the current version to apply version-specific migrations.
+    pub fn migrate(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        let version = upgrade::get_version(&env);
+        match version {
+            // v1 → v2: no data migration required in this example.
+            _ => {}
+        }
     }
 }

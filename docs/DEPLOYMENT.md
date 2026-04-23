@@ -1,259 +1,164 @@
-# Deployment Guide
-
-End-to-end guide for building, testing, and deploying the TipJar contract to testnet and mainnet.
-
----
+# TipJar Deployment Guide
 
 ## Prerequisites
 
-| Requirement | Notes |
-|---|---|
-| Rust toolchain (stable) | `rustup update stable` |
-| `wasm32v1-none` target | `rustup target add wasm32v1-none` |
-| Stellar CLI | [Install guide](https://developers.stellar.org/docs/tools/developer-tools/cli/install-cli) |
-| `jq` | Used by deploy scripts for config updates |
-| Funded Stellar account | Testnet: use Friendbot; Mainnet: fund via exchange |
+```bash
+# Install Stellar CLI
+cargo install --locked stellar-cli --features opt
 
----
+# Add WASM target
+rustup target add wasm32v1-none
+
+# Verify
+stellar --version
+```
 
 ## Build
 
 ```bash
-# Build optimized WASM
 cargo build -p tipjar --target wasm32v1-none --release
-
-# Optimize WASM size (reduces deployment cost)
-stellar contract optimize --wasm target/wasm32v1-none/release/tipjar.wasm
-# Output: target/wasm32v1-none/release/tipjar.optimized.wasm
 ```
 
----
-
-## Test Before Deploying
-
-```bash
-# Unit tests
-cargo test -p tipjar
-
-# Full integration test suite
-cargo test --workspace
-```
-
-All tests must pass before proceeding to deployment.
-
----
+The compiled WASM is at `target/wasm32v1-none/release/tipjar.wasm`.
 
 ## Testnet Deployment
 
-### 1. Set environment variables
-
 ```bash
-export DEPLOYER_SECRET=<your-testnet-secret-key>
+# 1. Generate and fund a deployer account
+stellar keys generate deployer --network testnet
+stellar keys fund deployer --network testnet
+
+# 2. Deploy the contract
+CONTRACT_ID=$(stellar contract deploy \
+  --wasm target/wasm32v1-none/release/tipjar.wasm \
+  --source deployer \
+  --network testnet)
+echo "Contract ID: $CONTRACT_ID"
+
+# 3. Initialize (fee = 1%, refund window = 7 days)
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source deployer \
+  --network testnet \
+  -- init \
+  --admin $(stellar keys address deployer) \
+  --fee_basis_points 100 \
+  --refund_window_seconds 604800
+
+# 4. Whitelist a token (e.g. native XLM)
+XLM_TOKEN=$(stellar contract id asset \
+  --asset native \
+  --network testnet)
+
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source deployer \
+  --network testnet \
+  -- add_token \
+  --admin $(stellar keys address deployer) \
+  --token $XLM_TOKEN
 ```
 
-### 2. Run the deploy script
+Or use the helper script:
 
 ```bash
 bash scripts/deploy_testnet.sh
 ```
 
-This script:
-1. Builds and optimizes the WASM
-2. Deploys to testnet via `stellar contract deploy`
-3. Verifies the contract is live
-4. Runs smoke tests
-5. Records the contract ID in `deployment/config.json`
-
-### 3. Initialize the contract
-
-```bash
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source $DEPLOYER_SECRET \
-  --network testnet \
-  -- init \
-  --admin ADMIN_ADDRESS \
-  --token TOKEN_ADDRESS
-```
-
-### 4. Whitelist additional tokens (if needed)
-
-```bash
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source $DEPLOYER_SECRET \
-  --network testnet \
-  -- add_token \
-  --admin ADMIN_ADDRESS \
-  --token ADDITIONAL_TOKEN_ADDRESS
-```
-
-### 5. Verify deployment
-
-```bash
-bash scripts/verify_deployment.sh $CONTRACT_ID testnet
-```
-
----
-
 ## Mainnet Deployment
 
-> Complete the [Mainnet Readiness Checklist](MAINNET_CHECKLIST.md) before proceeding.
-
-### 1. Set environment variables
-
 ```bash
-export DEPLOYER_SECRET=<your-mainnet-secret-key>
-```
-
-### 2. Run the mainnet deploy script
-
-```bash
-bash scripts/deploy-mainnet.sh
-# or equivalently:
 bash scripts/deploy_mainnet.sh
 ```
 
-The script requires interactive confirmation (`deploy mainnet`) unless `CI_MAINNET_CONFIRMED=true` is set.
+Review `scripts/deploy_mainnet.sh` before running — it requires a funded mainnet account and prompts for confirmation.
 
-### 3. Initialize the contract
+## Verify Deployment
+
+```bash
+# Check contract is initialized
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --network testnet \
+  -- is_paused
+
+# Check version
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --network testnet \
+  -- get_version
+```
+
+## Upgrading
+
+```bash
+# Build new WASM
+cargo build -p tipjar --target wasm32v1-none --release
+
+# Upload new WASM and get its hash
+NEW_HASH=$(stellar contract upload \
+  --wasm target/wasm32v1-none/release/tipjar.wasm \
+  --source deployer \
+  --network testnet)
+
+# Upgrade (admin only)
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source deployer \
+  --network testnet \
+  -- upgrade \
+  --new_wasm_hash $NEW_HASH
+```
+
+The contract version is incremented automatically. All storage is preserved.
+
+## Emergency Pause
 
 ```bash
 stellar contract invoke \
   --id $CONTRACT_ID \
-  --source $DEPLOYER_SECRET \
-  --network mainnet \
-  -- init \
-  --admin ADMIN_ADDRESS \
-  --token TOKEN_ADDRESS
-```
+  --source deployer \
+  --network testnet \
+  -- pause \
+  --admin $(stellar keys address deployer) \
+  --reason '"Emergency maintenance"'
 
-### 4. Post-deployment validation
-
-```bash
-# Verify contract is live
-bash scripts/verify_deployment.sh $CONTRACT_ID mainnet
-
-# Check contract version
+# Resume
 stellar contract invoke \
   --id $CONTRACT_ID \
-  --network mainnet \
-  -- get_contract_version
-
-# Test a read-only query
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --network mainnet \
-  -- get_total_tips \
-  --creator ADMIN_ADDRESS \
-  --token TOKEN_ADDRESS
+  --source deployer \
+  --network testnet \
+  -- unpause \
+  --admin $(stellar keys address deployer)
 ```
 
----
+## Environment Variables
 
-## Configuration
+| Variable | Description |
+|----------|-------------|
+| `CONTRACT_ID` | Deployed contract address |
+| `ADMIN_SECRET` | Admin account secret key |
+| `TOKEN_ADDR` | Whitelisted token contract address |
+| `STELLAR_NETWORK` | `testnet` or `mainnet` |
+| `STELLAR_RPC_URL` | Soroban RPC endpoint |
 
-Contract IDs and deployment history are stored in `deployment/config.json`:
+## Network RPC Endpoints
 
-```json
-{
-  "networks": {
-    "testnet": { "active_contract_id": "C..." },
-    "mainnet": { "active_contract_id": "C..." }
-  },
-  "history": [...]
-}
-```
+| Network | RPC URL |
+|---------|---------|
+| Testnet | `https://soroban-testnet.stellar.org` |
+| Mainnet | `https://mainnet.stellar.validationcloud.io/v1/<key>` |
+| Futurenet | `https://rpc-futurenet.stellar.org` |
 
----
-
-## Rollback Procedure
-
-If a critical issue is found after deployment:
-
-1. **Pause the contract immediately** to stop fund movement:
-   ```bash
-   stellar contract invoke \
-     --id $CONTRACT_ID \
-     --source $DEPLOYER_SECRET \
-     --network mainnet \
-     -- pause \
-     --caller ADMIN_ADDRESS \
-     --reason "Critical issue detected - investigating"
-   ```
-
-2. **Investigate** the issue. Check events via the indexer or Stellar Explorer.
-
-3. **Roll back** the active contract ID to the previous deployment:
-   ```bash
-   bash scripts/rollback.sh mainnet
-   ```
-   This updates `deployment/config.json` to point to the previous contract ID. Direct users to the previous contract while the fix is prepared.
-
-4. **Deploy a fix** using the standard deployment flow once the issue is resolved.
-
-5. **Unpause** (if the new contract was paused, not the rolled-back one):
-   ```bash
-   stellar contract invoke \
-     --id $NEW_CONTRACT_ID \
-     --source $DEPLOYER_SECRET \
-     --network mainnet \
-     -- unpause \
-     --caller ADMIN_ADDRESS
-   ```
-
----
-
-## Monitoring Setup
-
-### Prometheus + Grafana
+## Running Tests
 
 ```bash
-# Start monitoring stack
-docker-compose -f monitoring/docker-compose.yml up -d
-```
-
-- Prometheus config: `monitoring/prometheus/prometheus.yml`
-- Alert rules: `monitoring/prometheus/alert_rules.yml`
-- Grafana dashboard: `monitoring/grafana/contract_health.json`
-
-### Event Monitor
-
-```bash
-bash scripts/start_indexer.sh
-```
-
-Key alerts configured:
-- High transaction volume (>100 tx/5min)
-- Error rate >5%
-- Excessive gas usage
-- Indexer lag >100 ledgers
-
----
-
-## Troubleshooting
-
-See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for common errors and fixes.
-
-### Build fails: `can't find crate for 'std'`
-
-```bash
-rustup target add wasm32v1-none
-```
-
-### Deploy fails: `DEPLOYER_SECRET not set`
-
-```bash
-export DEPLOYER_SECRET=<your-secret-key>
-```
-
-### Contract not found after deploy
-
-Confirm the `--network` flag matches where you deployed. Check `deployment/config.json` for the recorded contract ID.
-
-### Stale test snapshots
-
-```bash
-rm -rf contracts/tipjar/test_snapshots
+# Unit + integration tests
 cargo test -p tipjar
+
+# Property tests
+cargo test --test property_tests -p tipjar
+
+# QuickCheck tests
+cargo test --test quickcheck_properties -p tipjar
 ```
