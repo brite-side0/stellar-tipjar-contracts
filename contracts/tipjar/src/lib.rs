@@ -152,6 +152,39 @@ pub struct MatchingProgram {
     pub active: bool,
 }
 
+/// A single recipient in a split tip, with share in basis points (10 000 = 100%).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipRecipient {
+    pub creator: Address,
+    /// Share in basis points; must be > 0. All shares must sum to 10 000.
+    pub percentage: u32,
+}
+
+/// Subscription status.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubscriptionStatus {
+    Active,
+    Paused,
+    Cancelled,
+}
+
+/// A recurring tip subscription from a subscriber to a creator.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Subscription {
+    pub subscriber: Address,
+    pub creator: Address,
+    pub token: Address,
+    pub amount: i128,
+    /// Minimum seconds between payments.
+    pub interval_seconds: u64,
+    pub last_payment: u64,
+    pub next_payment: u64,
+    pub status: SubscriptionStatus,
+}
+
 /// Storage layout for persistent contract data.
 #[derive(Clone)]
 #[contracttype]
@@ -206,6 +239,10 @@ pub enum DataKey {
     CurrentFeeBps,
     /// Monotonically increasing contract version, incremented on each upgrade.
     ContractVersion,
+    /// Subscription keyed by (subscriber, creator).
+    Subscription(Address, Address),
+    /// Human-readable reason stored when the contract is paused.
+    PauseReason,
 }
 
 #[contracterror]
@@ -236,6 +273,22 @@ pub enum TipJarError {
     ConditionFailed = 22,
     /// Caller is not the stored admin; upgrade rejected.
     UpgradeUnauthorized = 23,
+    /// Subscription does not exist.
+    SubscriptionNotFound = 24,
+    /// Subscription is not in Active state.
+    SubscriptionNotActive = 25,
+    /// Payment interval has not elapsed yet.
+    PaymentNotDue = 26,
+    /// Interval is below the minimum allowed.
+    InvalidInterval = 27,
+    /// Recipient count is outside the allowed range (2–10).
+    InvalidRecipientCount = 28,
+    /// Basis-point shares do not sum to 10 000.
+    InvalidPercentageSum = 29,
+    /// An individual share is zero.
+    InvalidPercentage = 30,
+    /// Contract is paused; state-changing operations are blocked.
+    ContractPaused = 31,
 }
 
 #[contract]
@@ -243,6 +296,73 @@ pub struct TipJarContract;
 
 #[contractimpl]
 impl TipJarContract {
+    // ── pause guard ──────────────────────────────────────────────────────────
+
+    fn require_not_paused(env: &Env) {
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(env, TipJarError::ContractPaused);
+        }
+    }
+
+    // ── leaderboard helpers ──────────────────────────────────────────────────
+
+    fn update_leaderboard_stats(
+        env: &Env,
+        tipper: &Address,
+        creator: &Address,
+        amount: i128,
+    ) {
+        const BUCKET_ALL_TIME: u32 = 0;
+        Self::update_aggregate(env, tipper, amount, BUCKET_ALL_TIME, ParticipantKind::Tipper);
+        Self::update_aggregate(env, creator, amount, BUCKET_ALL_TIME, ParticipantKind::Creator);
+    }
+
+    fn update_aggregate(
+        env: &Env,
+        addr: &Address,
+        amount: i128,
+        bucket: u32,
+        kind: ParticipantKind,
+    ) {
+        let agg_key = match kind {
+            ParticipantKind::Tipper => DataKey::TipperAggregate(addr.clone(), bucket),
+            ParticipantKind::Creator => DataKey::CreatorAggregate(addr.clone(), bucket),
+        };
+        let mut entry: LeaderboardEntry = env
+            .storage()
+            .persistent()
+            .get(&agg_key)
+            .unwrap_or(LeaderboardEntry {
+                address: addr.clone(),
+                total_amount: 0,
+                tip_count: 0,
+            });
+        entry.total_amount += amount;
+        entry.tip_count += 1;
+        env.storage().persistent().set(&agg_key, &entry);
+
+        let part_key = match kind {
+            ParticipantKind::Tipper => DataKey::TipperParticipants(bucket),
+            ParticipantKind::Creator => DataKey::CreatorParticipants(bucket),
+        };
+        let mut participants: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&part_key)
+            .unwrap_or_else(|| Vec::new(env));
+        if !participants.contains(addr) {
+            participants.push_back(addr.clone());
+            env.storage().persistent().set(&part_key, &participants);
+        }
+    }
+
+    // ── initialization ───────────────────────────────────────────────────────
+
     /// One-time setup to choose the administrator for the TipJar.
     pub fn init(env: Env, admin: Address, fee_basis_points: u32, refund_window_seconds: u64) {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -276,6 +396,44 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::TokenWhitelist(token), &true);
+    }
+
+    /// Pauses all state-changing operations. Admin only.
+    ///
+    /// `reason` is stored on-chain for transparency.
+    /// Emits `("paused",)` with data `(admin, reason)`.
+    pub fn pause(env: Env, admin: Address, reason: String) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage().instance().set(&DataKey::PauseReason, &reason);
+        env.events()
+            .publish((symbol_short!("paused"),), (admin, reason));
+    }
+
+    /// Resumes normal operations. Admin only.
+    ///
+    /// Emits `("unpaused",)` with data `admin`.
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().remove(&DataKey::PauseReason);
+        env.events().publish((symbol_short!("unpaused"),), admin);
+    }
+
+    /// Returns `true` when the contract is paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Transfers `amount` of `token` from `sender` into escrow for `creator`.
@@ -317,6 +475,7 @@ impl TipJarContract {
             .unwrap_or_else(|| env.storage().instance().get(&tot_key).unwrap_or(0));
         let new_tot: i128 = existing_tot + amount;
         env.storage().persistent().set(&tot_key, &new_tot);
+        Self::update_leaderboard_stats(&env, &sender, &creator, amount);
         env.events().publish((symbol_short!("tip"), creator.clone()), (sender, amount));
         tip_id
     }
@@ -325,6 +484,7 @@ impl TipJarContract {
     ///
     /// Emits `("withdraw", creator)` with data `amount`.
     pub fn withdraw(env: Env, creator: Address, token: Address) {
+        Self::require_not_paused(&env);
         creator.require_auth();
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
         let amount: i128 = env.storage().persistent().get(&bal_key)
@@ -351,6 +511,69 @@ impl TipJarContract {
             .unwrap_or_else(|| env.storage().instance().get(&key).unwrap_or(0))
     }
 
+    /// Returns the top N participants (tippers or creators) for a given time period.
+    ///
+    /// Results are sorted by `total_amount` descending. `limit` is capped at 100.
+    pub fn get_leaderboard(
+        env: Env,
+        period: TimePeriod,
+        kind: ParticipantKind,
+        limit: u32,
+    ) -> Vec<LeaderboardEntry> {
+        let bucket = match period {
+            TimePeriod::AllTime => 0,
+            _ => 0, // Monthly/Weekly not implemented; default to AllTime
+        };
+        let part_key = match kind {
+            ParticipantKind::Tipper => DataKey::TipperParticipants(bucket),
+            ParticipantKind::Creator => DataKey::CreatorParticipants(bucket),
+        };
+        let participants: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&part_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let cap = if limit > 100 { 100 } else { limit };
+        let mut entries = Vec::new(&env);
+        for addr in participants.iter() {
+            let agg_key = match kind {
+                ParticipantKind::Tipper => DataKey::TipperAggregate(addr.clone(), bucket),
+                ParticipantKind::Creator => DataKey::CreatorAggregate(addr.clone(), bucket),
+            };
+            if let Some(entry) = env.storage().persistent().get::<_, LeaderboardEntry>(&agg_key) {
+                entries.push_back(entry);
+            }
+        }
+
+        // Build top-N by repeated linear scan (O(n*cap), cap ≤ 100, n ≤ participants).
+        // Avoids in-place mutation since Soroban Vec has no set().
+        let mut result = Vec::new(&env);
+        let mut used = Vec::<u32>::new(&env);
+        for _ in 0..cap {
+            if used.len() == entries.len() {
+                break;
+            }
+            let mut best_idx: Option<u32> = None;
+            let mut best_amt: i128 = -1;
+            for idx in 0..entries.len() {
+                if used.contains(&idx) {
+                    continue;
+                }
+                let amt = entries.get(idx).unwrap().total_amount;
+                if amt > best_amt {
+                    best_amt = amt;
+                    best_idx = Some(idx);
+                }
+            }
+            if let Some(idx) = best_idx {
+                result.push_back(entries.get(idx).unwrap());
+                used.push_back(idx);
+            }
+        }
+        result
+    }
+
     /// Executes a token tip only if all provided conditions evaluate to true.
     ///
     /// Returns true when the transfer is executed and false when conditions fail.
@@ -362,6 +585,7 @@ impl TipJarContract {
         amount: i128,
         condition_list: Vec<conditions::types::Condition>,
     ) -> bool {
+        Self::require_not_paused(&env);
         sender.require_auth();
 
         if amount <= 0 {
@@ -409,6 +633,7 @@ impl TipJarContract {
         amount: i128,
         congestion: u32,
     ) {
+        Self::require_not_paused(&env);
         sender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
@@ -461,5 +686,243 @@ impl TipJarContract {
     /// Returns the current contract version (0 before the first upgrade).
     pub fn get_version(env: Env) -> u32 {
         upgrade::get_version(&env)
+    }
+
+    /// Creates a recurring tip subscription from `subscriber` to `creator`.
+    ///
+    /// The first payment becomes due immediately (at creation time).
+    /// Minimum interval is 1 day (86 400 seconds).
+    ///
+    /// Emits `("sub_new", creator)` with data `(subscriber, amount, interval_seconds)`.
+    pub fn create_subscription(
+        env: Env,
+        subscriber: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        interval_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        subscriber.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        const MIN_INTERVAL: u64 = 86_400;
+        if interval_seconds < MIN_INTERVAL {
+            panic_with_error!(&env, TipJarError::InvalidInterval);
+        }
+        let now = env.ledger().timestamp();
+        let sub = Subscription {
+            subscriber: subscriber.clone(),
+            creator: creator.clone(),
+            token,
+            amount,
+            interval_seconds,
+            last_payment: 0,
+            next_payment: now,
+            status: SubscriptionStatus::Active,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscriber.clone(), creator.clone()), &sub);
+        env.events().publish(
+            (symbol_short!("sub_new"), creator),
+            (subscriber, amount, interval_seconds),
+        );
+    }
+
+    /// Executes a due subscription payment, transferring tokens from subscriber
+    /// into escrow for the creator.
+    ///
+    /// Anyone may call this; the subscriber's auth is pulled via `transfer`.
+    /// Emits `("sub_pay", creator)` with data `(subscriber, amount)`.
+    pub fn execute_subscription_payment(env: Env, subscriber: Address, creator: Address) {
+        Self::require_not_paused(&env);
+        let key = DataKey::Subscription(subscriber.clone(), creator.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::SubscriptionNotFound));
+
+        if sub.status != SubscriptionStatus::Active {
+            panic_with_error!(&env, TipJarError::SubscriptionNotActive);
+        }
+        let now = env.ledger().timestamp();
+        if now < sub.next_payment {
+            panic_with_error!(&env, TipJarError::PaymentNotDue);
+        }
+
+        token::Client::new(&env, &sub.token).transfer(
+            &subscriber,
+            &env.current_contract_address(),
+            &sub.amount,
+        );
+
+        let bal_key = DataKey::CreatorBalance(creator.clone(), sub.token.clone());
+        let bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        env.storage().persistent().set(&bal_key, &(bal + sub.amount));
+
+        let tot_key = DataKey::CreatorTotal(creator.clone(), sub.token.clone());
+        let tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
+        env.storage().persistent().set(&tot_key, &(tot + sub.amount));
+
+        sub.last_payment = now;
+        sub.next_payment = now + sub.interval_seconds;
+        env.storage().persistent().set(&key, &sub);
+
+        env.events().publish(
+            (symbol_short!("sub_pay"), creator),
+            (subscriber, sub.amount),
+        );
+    }
+
+    /// Pauses an active subscription. Only the subscriber may pause.
+    ///
+    /// Emits `("sub_paus", creator)` with data `subscriber`.
+    pub fn pause_subscription(env: Env, subscriber: Address, creator: Address) {
+        Self::require_not_paused(&env);
+        subscriber.require_auth();
+        let key = DataKey::Subscription(subscriber.clone(), creator.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::SubscriptionNotFound));
+        if sub.status != SubscriptionStatus::Active {
+            panic_with_error!(&env, TipJarError::SubscriptionNotActive);
+        }
+        sub.status = SubscriptionStatus::Paused;
+        env.storage().persistent().set(&key, &sub);
+        env.events()
+            .publish((symbol_short!("sub_paus"), creator), subscriber);
+    }
+
+    /// Resumes a paused subscription. Only the subscriber may resume.
+    ///
+    /// Resets `next_payment` to now so a payment can be executed immediately.
+    /// Emits `("sub_res", creator)` with data `subscriber`.
+    pub fn resume_subscription(env: Env, subscriber: Address, creator: Address) {
+        Self::require_not_paused(&env);
+        subscriber.require_auth();
+        let key = DataKey::Subscription(subscriber.clone(), creator.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::SubscriptionNotFound));
+        if sub.status != SubscriptionStatus::Paused {
+            panic_with_error!(&env, TipJarError::SubscriptionNotActive);
+        }
+        sub.status = SubscriptionStatus::Active;
+        sub.next_payment = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &sub);
+        env.events()
+            .publish((symbol_short!("sub_res"), creator), subscriber);
+    }
+
+    /// Cancels a subscription. Only the subscriber may cancel.
+    ///
+    /// Emits `("sub_cncl", creator)` with data `subscriber`.
+    pub fn cancel_subscription(env: Env, subscriber: Address, creator: Address) {
+        Self::require_not_paused(&env);
+        subscriber.require_auth();
+        let key = DataKey::Subscription(subscriber.clone(), creator.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::SubscriptionNotFound));
+        sub.status = SubscriptionStatus::Cancelled;
+        env.storage().persistent().set(&key, &sub);
+        env.events()
+            .publish((symbol_short!("sub_cncl"), creator), subscriber);
+    }
+
+    /// Returns the subscription between `subscriber` and `creator`, if it exists.
+    pub fn get_subscription(
+        env: Env,
+        subscriber: Address,
+        creator: Address,
+    ) -> Option<Subscription> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Subscription(subscriber, creator))
+    }
+
+    /// Splits a single tip among multiple recipients proportionally.
+    ///
+    /// `recipients` must contain 2–10 entries whose `percentage` values (basis
+    /// points) sum to exactly 10 000.  The last recipient absorbs any rounding
+    /// remainder so the full `amount` is always distributed.
+    ///
+    /// Emits `("tip_splt", creator)` with data `(sender, recipient_amount, percentage)`
+    /// for every recipient.
+    pub fn tip_split(
+        env: Env,
+        sender: Address,
+        token: Address,
+        recipients: Vec<TipRecipient>,
+        amount: i128,
+    ) {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        let count = recipients.len();
+        if count < 2 || count > 10 {
+            panic_with_error!(&env, TipJarError::InvalidRecipientCount);
+        }
+        let mut total_pct: u32 = 0;
+        for r in recipients.iter() {
+            if r.percentage == 0 {
+                panic_with_error!(&env, TipJarError::InvalidPercentage);
+            }
+            total_pct += r.percentage;
+        }
+        if total_pct != 10_000 {
+            panic_with_error!(&env, TipJarError::InvalidPercentageSum);
+        }
+
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let last_idx = count - 1;
+        let mut distributed: i128 = 0;
+        for (i, r) in recipients.iter().enumerate() {
+            let share = if i == last_idx as usize {
+                amount - distributed
+            } else {
+                (amount * r.percentage as i128) / 10_000
+            };
+
+            let bal_key = DataKey::CreatorBalance(r.creator.clone(), token.clone());
+            let bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+            env.storage().persistent().set(&bal_key, &(bal + share));
+
+            let tot_key = DataKey::CreatorTotal(r.creator.clone(), token.clone());
+            let tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
+            env.storage().persistent().set(&tot_key, &(tot + share));
+
+            distributed += share;
+
+            env.events().publish(
+                (symbol_short!("tip_splt"), r.creator.clone()),
+                (sender.clone(), share, r.percentage),
+            );
+        }
     }
 }
