@@ -36,6 +36,24 @@ pub mod conditions;
 // Dynamic fee adjustment
 pub mod fees;
 
+/// A tip record that includes an optional memo and timestamp.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipWithMemo {
+    pub sender: Address,
+    pub amount: i128,
+    pub memo: Option<String>,
+    pub timestamp: u64,
+}
+
+/// Combined creator stats stored in a single persistent entry to reduce storage reads/writes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatorStats {
+    pub balance: i128,
+    pub total: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TipWithMessage {
@@ -245,6 +263,12 @@ pub enum DataKey {
     Subscription(Address, Address),
     /// Human-readable reason stored when the contract is paused.
     PauseReason,
+    /// Number of memo-tips stored for a creator (u64).
+    TipCount(Address),
+    /// Individual memo-tip record keyed by (creator, tip_index).
+    TipData(Address, u64),
+    /// Combined balance+total for a creator per token (single storage entry).
+    CreatorStats(Address, Address),
 }
 
 #[contracterror]
@@ -291,6 +315,8 @@ pub enum TipJarError {
     InvalidPercentage = 30,
     /// Contract is paused; state-changing operations are blocked.
     ContractPaused = 31,
+    /// Memo exceeds the 200-character limit.
+    MemoTooLong = 32,
 }
 
 #[contract]
@@ -850,6 +876,121 @@ impl TipJarContract {
         env.storage()
             .persistent()
             .get(&DataKey::Subscription(subscriber, creator))
+    }
+
+    // ── CreatorStats helper (gas optimization) ───────────────────────────────
+
+    /// Reads combined balance+total for a creator/token in one storage call.
+    fn read_creator_stats(env: &Env, creator: &Address, token: &Address) -> CreatorStats {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CreatorStats(creator.clone(), token.clone()))
+            .unwrap_or(CreatorStats { balance: 0, total: 0 })
+    }
+
+    /// Writes combined balance+total for a creator/token in one storage call.
+    fn write_creator_stats(env: &Env, creator: &Address, token: &Address, stats: &CreatorStats) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::CreatorStats(creator.clone(), token.clone()), stats);
+    }
+
+    // ── memo tips ────────────────────────────────────────────────────────────
+
+    /// Sends a tip with an optional memo (max 200 UTF-8 characters).
+    ///
+    /// Stores the tip record on-chain and credits the creator's balance.
+    /// Emits `("tip_memo", creator)` with data `(sender, amount)`.
+    ///
+    /// # Panics
+    /// * `InvalidAmount` – if `amount <= 0`
+    /// * `MemoTooLong`   – if memo exceeds 200 characters
+    /// * `TokenNotWhitelisted` – if the token is not approved
+    pub fn tip_with_memo(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        memo: Option<String>,
+    ) {
+        Self::require_not_paused(&env);
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        if let Some(ref m) = memo {
+            if m.len() > 200 {
+                panic_with_error!(&env, TipJarError::MemoTooLong);
+            }
+        }
+        sender.require_auth();
+
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        // Update creator stats with a single read/write (gas optimization).
+        let mut stats = Self::read_creator_stats(&env, &creator, &token);
+        stats.balance += amount;
+        stats.total += amount;
+        Self::write_creator_stats(&env, &creator, &token, &stats);
+
+        // Store the tip record.
+        let tip_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TipCount(creator.clone()))
+            .unwrap_or(0);
+        let tip_data = TipWithMemo {
+            sender: sender.clone(),
+            amount,
+            memo,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::TipData(creator.clone(), tip_count), &tip_data);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TipCount(creator.clone()), &(tip_count + 1));
+
+        Self::update_leaderboard_stats(&env, &sender, &creator, amount);
+        env.events()
+            .publish((symbol_short!("tip_memo"), creator), (sender, amount));
+    }
+
+    /// Returns the most recent `limit` memo-tips for `creator` (up to 50).
+    pub fn get_tips_with_memos(env: Env, creator: Address, limit: u32) -> Vec<TipWithMemo> {
+        let tip_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TipCount(creator.clone()))
+            .unwrap_or(0);
+
+        let cap = if limit > 50 { 50 } else { limit } as u64;
+        let start = tip_count.saturating_sub(cap);
+        let mut tips = Vec::new(&env);
+        for i in start..tip_count {
+            if let Some(tip) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TipData(creator.clone(), i))
+            {
+                tips.push_back(tip);
+            }
+        }
+        tips
     }
 
     /// Splits a single tip among multiple recipients proportionally.

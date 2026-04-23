@@ -23,6 +23,7 @@ rand = "0.8"
 base64 = "0.22"
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
+proptest = "1.4"
 
 [[test]]
 name = "gas_benchmarks"
@@ -31,3 +32,7 @@ path = "benches/gas_benchmarks.rs"
 [[test]]
 name = "quickcheck_properties"
 path = "tests/quickcheck_properties.rs"
+
+[[test]]
+name = "property_tests"
+path = "tests/property_tests.rs"
