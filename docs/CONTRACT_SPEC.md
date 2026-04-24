@@ -14,6 +14,20 @@ One-time setup. Stores the admin address, platform fee, and refund window.
 - Panics: `AlreadyInitialized` if called more than once.
 - Panics: `FeeExceedsMaximum` if `fee_basis_points > 500` (5%).
 
+#### `get_refund_window() -> u64`
+Returns the current tip refund/expiration window in seconds.
+
+#### `set_refund_window(admin: Address, refund_window_seconds: u64)`
+Updates the refund window used by time-locked tips. Admin only.
+
+#### `process_expired_tips() -> u32`
+Scans active time-locked tips and refunds those whose expiry window has passed. Returns the number of refunds processed.
+
+- Emits: `("tip_expired", creator)` for each refunded tip.
+
+#### `get_expired_time_locks() -> Vec<TipWithExpiry>`
+Returns the list of active, expired time-locked tips with expiry metadata.
+
 #### `add_token(admin: Address, token: Address)`
 Whitelists a token for use in tips. Admin only.
 

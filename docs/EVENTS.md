@@ -83,6 +83,34 @@ data:   400
 
 ---
 
+## `tip_expired`
+
+Emitted when an unclaimed time-locked tip is refunded after its expiration window.
+
+**Topics**
+
+| Position | Value | Type |
+|---|---|---|
+| 0 | `"tip_expired"` | `Symbol` |
+| 1 | `creator` | `Address` |
+
+**Data**
+
+| Field | Type | Description |
+|---|---|---|
+| `sender` | `Address` | The original tipper's address |
+| `amount` | `i128` | Refunded token amount |
+| `expires_at` | `u64` | Expiry timestamp that triggered the refund |
+| `lock_id` | `u64` | Identifier for the refunded time-lock |
+
+**Example (conceptual)**
+```
+topics: ["tip_expired", "GCREATOR..."]
+data:   ["GSENDER...", 500, 1_800_000_100, 0]
+```
+
+---
+
 ## Querying Events
 
 Use the Stellar CLI to stream or query events from a deployed contract:

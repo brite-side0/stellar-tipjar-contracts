@@ -11,6 +11,10 @@ use tipjar::{DataKey, TipJarContract, TipJarContractClient, TipJarError, TipMeta
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn setup() -> (Env, TipJarContractClient<'static>, Address, Address, Address) {
+    setup_with_expiry(0)
+}
+
+fn setup_with_expiry(expiry_seconds: u64) -> (Env, TipJarContractClient<'static>, Address, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -23,7 +27,7 @@ fn setup() -> (Env, TipJarContractClient<'static>, Address, Address, Address) {
     // Deploy a mock token.
     let token_id = env.register_stellar_asset_contract(token_admin.clone());
 
-    client.init(&admin, &0u32, &0u64);
+    client.init(&admin, &0u32, &expiry_seconds);
     client.add_token(&admin, &token_id);
 
     // Fund sender with tokens via the asset contract.
@@ -188,4 +192,29 @@ fn test_existing_tip_behavior_unaffected() {
 
     // But balance should be credited.
     assert_eq!(client.get_withdrawable_balance(&creator, &token), 200i128);
+}
+
+#[test]
+fn test_process_expired_tips_refunds_unclaimed_locked_tip() {
+    let (env, client, sender, creator, token) = setup_with_expiry(100);
+
+    let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+
+    let current_time = env.ledger().timestamp();
+    let unlock_time = current_time + 1_000;
+    let lock_id = client.tip_locked(&sender, &creator, &token, &500i128, &unlock_time);
+
+    assert_eq!(lock_id, 0);
+    assert_eq!(client.get_refund_window(), 100u64);
+
+    // Advance time past the expiry window but before unlock time.
+    env.ledger().with_mut(|ledger| ledger.timestamp += 101);
+
+    let refunded_count = client.process_expired_tips();
+    assert_eq!(refunded_count, 1);
+
+    // Sender should be refunded and lock should be removed.
+    assert_eq!(token_client.balance(&sender), 1_000i128);
+    let result = client.try_tip_locked(&sender, &creator, &token, &500i128, &unlock_time);
+    assert!(result.is_ok(), "locked tip should still be creatable after refund");
 }

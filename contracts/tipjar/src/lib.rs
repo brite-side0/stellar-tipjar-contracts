@@ -67,6 +67,17 @@ pub struct TipWithMessage {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipWithExpiry {
+    pub tipper: Address,
+    pub creator: Address,
+    pub amount: i128,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub claimed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Milestone {
     pub id: u64,
     pub creator: Address,
@@ -255,8 +266,11 @@ pub struct Subscription {
 pub struct TimeLock {
     pub sender: Address,
     pub creator: Address,
+    pub token: Address,
     pub amount: i128,
     pub unlock_time: u64,
+    pub created_at: u64,
+    pub expires_at: u64,
     pub cancelled: bool,
 }
 
@@ -390,6 +404,8 @@ pub enum DataKey {
     NextLockId,
     /// List of lock IDs belonging to a creator.
     CreatorLocks(Address),
+    /// Active time-lock IDs for expiration processing.
+    ActiveTimeLocks,
     /// Time-lock record keyed by lock ID.
     TimeLock(u64),
     /// Multi-sig withdrawal request keyed by request ID.
@@ -1380,11 +1396,20 @@ impl TipJarContract {
             .persistent()
             .get(&DataKey::NextLockId)
             .unwrap_or(0);
+        let created_at = env.ledger().timestamp();
+        let refund_window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundWindow)
+            .unwrap_or(0);
         let time_lock = TimeLock {
             sender: sender.clone(),
             creator: creator.clone(),
+            token: token.clone(),
             amount,
             unlock_time,
+            created_at,
+            expires_at: created_at.saturating_add(refund_window),
             cancelled: false,
         };
         env.storage().persistent().set(&DataKey::TimeLock(lock_id), &time_lock);
@@ -1398,6 +1423,8 @@ impl TipJarContract {
         creator_locks.push_back(lock_id);
         env.storage().persistent().set(&DataKey::CreatorLocks(creator.clone()), &creator_locks);
 
+        Self::add_active_time_lock(&env, lock_id);
+
         // External call last.
         token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
 
@@ -1406,6 +1433,18 @@ impl TipJarContract {
             (sender, amount, unlock_time, lock_id),
         );
         lock_id
+    }
+
+    /// Convenience wrapper matching the public `tip_locked` API.
+    pub fn tip_locked(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        unlock_time: u64,
+    ) -> u64 {
+        Self::tip_time_locked(env, sender, creator, token, amount, unlock_time)
     }
 
     /// Withdraws a time-locked tip after its unlock time. Only `creator` may call.
@@ -1433,6 +1472,7 @@ impl TipJarContract {
 
         // State update before external call (CEI).
         env.storage().persistent().remove(&DataKey::TimeLock(lock_id));
+        Self::remove_active_time_lock(&env, lock_id);
 
         token::Client::new(&env, &token).transfer(
             &env.current_contract_address(),
@@ -1444,6 +1484,11 @@ impl TipJarContract {
             (symbol_short!("unlock"), creator),
             (time_lock.amount, lock_id),
         );
+    }
+
+    /// Convenience wrapper matching the public `withdraw_locked` API.
+    pub fn withdraw_locked(env: Env, creator: Address, token: Address, lock_id: u64) {
+        Self::withdraw_time_locked(env, creator, token, lock_id)
     }
 
     /// Cancels a time-locked tip and refunds the sender. Only the original sender may call.
@@ -1469,6 +1514,7 @@ impl TipJarContract {
         // State update before external call (CEI).
         time_lock.cancelled = true;
         env.storage().persistent().set(&DataKey::TimeLock(lock_id), &time_lock);
+        Self::remove_active_time_lock(&env, lock_id);
 
         token::Client::new(&env, &token).transfer(
             &env.current_contract_address(),
@@ -1480,6 +1526,11 @@ impl TipJarContract {
             (symbol_short!("lk_cncl"), sender),
             (time_lock.amount, lock_id),
         );
+    }
+
+    /// Convenience wrapper matching the public `cancel_locked` API.
+    pub fn cancel_locked(env: Env, sender: Address, token: Address, lock_id: u64) {
+        Self::cancel_time_lock(env, sender, token, lock_id)
     }
 
     /// Returns all time-lock records for `creator`.
@@ -1500,6 +1551,156 @@ impl TipJarContract {
             }
         }
         locks
+    }
+
+    /// Returns a single active locked tip for `creator`.
+    pub fn get_locked_tip(env: Env, creator: Address, lock_id: u64) -> LockedTip {
+        let time_lock: TimeLock = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimeLock(lock_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockNotFound));
+
+        if time_lock.creator != creator {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        LockedTip {
+            sender: time_lock.sender.clone(),
+            creator: time_lock.creator.clone(),
+            token: time_lock.token.clone(),
+            amount: time_lock.amount,
+            unlock_timestamp: time_lock.unlock_time,
+        }
+    }
+
+    /// Returns the refund window used to compute tip expiry.
+    pub fn get_refund_window(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RefundWindow)
+            .unwrap_or(0)
+    }
+
+    /// Updates the refund window used by time-locked tips.
+    /// Admin only.
+    pub fn set_refund_window(env: Env, admin: Address, refund_window_seconds: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundWindow, &refund_window_seconds);
+        env.events().publish((symbol_short!("refund_window"),), refund_window_seconds);
+    }
+
+    /// Returns all expired time-locked tips whose refund window has passed.
+    fn get_expired_time_lock_ids(env: &Env, current_time: u64) -> Vec<u64> {
+        let lock_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveTimeLocks)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut expired = Vec::new(env);
+        for lock_id in lock_ids.iter() {
+            if let Some(lock) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TimeLock>(&DataKey::TimeLock(lock_id))
+            {
+                if !lock.cancelled && lock.expires_at <= current_time {
+                    expired.push_back(lock_id);
+                }
+            }
+        }
+        expired
+    }
+
+    /// Processes all expired time-locked tips and refunds their senders.
+    /// Returns the number of refunded tips.
+    pub fn get_expired_time_locks(env: Env) -> Vec<TipWithExpiry> {
+        let current_time = env.ledger().timestamp();
+        let expired_ids = Self::get_expired_time_lock_ids(&env, current_time);
+        let mut result = Vec::new(&env);
+        for lock_id in expired_ids.iter() {
+            if let Some(lock) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TimeLock>(&DataKey::TimeLock(lock_id))
+            {
+                result.push_back(TipWithExpiry {
+                    tipper: lock.sender.clone(),
+                    creator: lock.creator.clone(),
+                    amount: lock.amount,
+                    created_at: lock.created_at,
+                    expires_at: lock.expires_at,
+                    claimed: false,
+                });
+            }
+        }
+        result
+    }
+
+    pub fn process_expired_tips(env: Env) -> u32 {
+        let current_time = env.ledger().timestamp();
+        let expired_locks = Self::get_expired_time_lock_ids(&env, current_time);
+        let mut refunded_count = 0u32;
+        for lock_id in expired_locks.iter() {
+            if let Some(time_lock) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TimeLock>(&DataKey::TimeLock(lock_id))
+            {
+                if !time_lock.cancelled {
+                    Self::refund_time_lock(&env, lock_id, &time_lock);
+                    refunded_count += 1;
+                }
+            }
+        }
+        refunded_count
+    }
+
+    fn add_active_time_lock(env: &Env, lock_id: u64) {
+        let mut active: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveTimeLocks)
+            .unwrap_or_else(|| Vec::new(env));
+        if !active.contains(&lock_id) {
+            active.push_back(lock_id);
+        }
+        env.storage().persistent().set(&DataKey::ActiveTimeLocks, &active);
+    }
+
+    fn remove_active_time_lock(env: &Env, lock_id: u64) {
+        let active: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveTimeLocks)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut remaining = Vec::new(env);
+        for id in active.iter() {
+            if id != lock_id {
+                remaining.push_back(id);
+            }
+        }
+        env.storage().persistent().set(&DataKey::ActiveTimeLocks, &remaining);
+    }
+
+    fn refund_time_lock(env: &Env, lock_id: u64, time_lock: &TimeLock) {
+        env.storage().persistent().remove(&DataKey::TimeLock(lock_id));
+        Self::remove_active_time_lock(env, lock_id);
+        token::Client::new(&env, &time_lock.token).transfer(
+            &env.current_contract_address(),
+            &time_lock.sender,
+            &time_lock.amount,
+        );
+        env.events().publish(
+            (symbol_short!("tip_expired"), time_lock.creator.clone()),
+            (time_lock.sender.clone(), time_lock.amount, time_lock.expires_at, lock_id),
+        );
     }
 
     // ── withdrawal limits ─────────────────────────────────────────────────────
