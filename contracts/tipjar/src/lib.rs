@@ -2542,4 +2542,84 @@ impl TipJarContract {
             .get(&DataKey::DisputeEvidence(dispute_id, evidence_idx))
             .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound))
     }
+
+    // ── batch tipping ─────────────────────────────────────────────────────────
+
+    /// Sends multiple tips in a single transaction to reduce gas costs.
+    ///
+    /// `tips` is a vector of (creator, amount) pairs. Returns the number of successful tips.
+    /// Emits `("batch_tip",)` with data `(tipper, count, total_amount)`.
+    pub fn batch_tip(
+        env: Env,
+        tipper: Address,
+        token: Address,
+        tips: Vec<BatchTip>,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        tipper.require_auth();
+
+        if tips.len() == 0 || tips.len() > 100 {
+            panic_with_error!(&env, TipJarError::BatchTooLarge);
+        }
+
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        let mut total_amount: i128 = 0;
+        for tip in tips.iter() {
+            if tip.amount <= 0 {
+                panic_with_error!(&env, TipJarError::InvalidAmount);
+            }
+            total_amount = total_amount.checked_add(tip.amount).expect("total overflow");
+        }
+
+        // Transfer all tokens at once
+        token::Client::new(&env, &token).transfer(&tipper, &env.current_contract_address(), &total_amount);
+
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let mut successful_tips: u32 = 0;
+
+        for tip in tips.iter() {
+            let fee: i128 = (tip.amount * fee_bp as i128) / 10_000;
+            let creator_amount = tip.amount - fee;
+
+            if fee > 0 {
+                let fee_key = DataKey::PlatformFeeBalance(token.clone());
+                let new_fee_bal: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&fee_key)
+                    .unwrap_or(0)
+                    .checked_add(fee)
+                    .expect("fee overflow");
+                env.storage().instance().set(&fee_key, &new_fee_bal);
+            }
+
+            let bal_key = DataKey::CreatorBalance(tip.creator.clone(), token.clone());
+            let existing_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+            let new_bal: i128 = existing_bal.checked_add(creator_amount).expect("balance overflow");
+            env.storage().persistent().set(&bal_key, &new_bal);
+
+            let tot_key = DataKey::CreatorTotal(tip.creator.clone(), token.clone());
+            let existing_tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
+            let new_tot: i128 = existing_tot.checked_add(creator_amount).expect("total overflow");
+            env.storage().persistent().set(&tot_key, &new_tot);
+
+            Self::update_leaderboard_stats(&env, &tipper, &tip.creator, creator_amount);
+            successful_tips += 1;
+        }
+
+        env.events().publish(
+            (symbol_short!("batch_tip"),),
+            (tipper, successful_tips, total_amount),
+        );
+
+        successful_tips
+    }
 }
