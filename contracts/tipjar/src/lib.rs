@@ -347,6 +347,8 @@ pub enum DataKey {
     CreatorBalance(Address, Address), // (creator, token)
     /// Historical total tips ever received by creator per token.
     CreatorTotal(Address, Address),   // (creator, token)
+    /// List of token addresses a creator has ever received tips in.
+    CreatorTokens(Address),
     /// Emergency pause state (bool).
     Paused,
     /// Contract administrator (Address).
@@ -618,16 +620,13 @@ impl TipJarContract {
     // ── initialization ───────────────────────────────────────────────────────
 
     /// One-time setup to choose the administrator for the TipJar.
-    pub fn init(env: Env, admin: Address, fee_basis_points: u32, refund_window_seconds: u64) {
+    pub fn init(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, TipJarError::AlreadyInitialized);
         }
-        if fee_basis_points > 500 {
-            panic_with_error!(&env, TipJarError::FeeExceedsMaximum);
-        }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::FeeBasisPoints, &fee_basis_points);
-        env.storage().instance().set(&DataKey::RefundWindow, &refund_window_seconds);
+        env.storage().instance().set(&DataKey::FeeBasisPoints, &0u32);
+        env.storage().instance().set(&DataKey::RefundWindow, &0u64);
     }
 
     /// Sets an off-chain condition flag that can later be referenced in
@@ -650,6 +649,24 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::TokenWhitelist(token), &true);
+    }
+
+    /// Removes a token from the whitelist. Admin only.
+    pub fn remove_token(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::TokenWhitelist(token), &false);
+    }
+
+    /// Returns `true` if `token` is on the whitelist.
+    pub fn is_whitelisted(env: Env, token: Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::TokenWhitelist(token))
+            .unwrap_or(false)
     }
 
     /// Pauses all state-changing operations. Admin only.
@@ -740,6 +757,9 @@ impl TipJarContract {
         env.storage().instance().set(&DataKey::TipCounter, &(tip_id + 1));
 
         Self::update_leaderboard_stats(&env, &sender, &creator, creator_amount);
+
+        // Track which tokens this creator has received
+        Self::track_creator_token(&env, &creator, &token);
 
         // Check and award milestones
         Self::check_and_award_milestones(&env, &creator, &token, new_tot);
@@ -940,6 +960,20 @@ impl TipJarContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Records `token` in the creator's token list if not already present.
+    fn track_creator_token(env: &Env, creator: &Address, token: &Address) {
+        let key = DataKey::CreatorTokens(creator.clone());
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if !tokens.contains(token) {
+            tokens.push_back(token.clone());
+            env.storage().persistent().set(&key, &tokens);
+        }
+    }
+
     fn add_delegate(env: &Env, creator: &Address, delegate: &Address) {
         let mut delegates: Vec<Address> = env
             .storage()
@@ -993,6 +1027,14 @@ impl TipJarContract {
         let key = DataKey::CreatorTotal(creator.clone(), token.clone());
         env.storage().persistent().get(&key)
             .unwrap_or_else(|| env.storage().instance().get(&key).unwrap_or(0))
+    }
+
+    /// Returns all token addresses that `creator` has ever received tips in.
+    pub fn get_creator_tokens(env: Env, creator: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CreatorTokens(creator))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Returns the top N participants (tippers or creators) for a given time period.
