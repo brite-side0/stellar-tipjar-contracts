@@ -182,6 +182,40 @@ pub struct MatchingProgram {
     pub active: bool,
 }
 
+/// A time-boxed sponsor matching campaign with a budget and expiry.
+///
+/// `match_ratio` is in basis points: 100 = 1:1, 200 = 2:1.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MatchingCampaign {
+    pub sponsor: Address,
+    pub creator: Address,
+    pub token: Address,
+    /// Match ratio in basis points (100 = 1:1, 200 = 2:1).
+    pub match_ratio: u32,
+    pub total_budget: i128,
+    pub remaining_budget: i128,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub active: bool,
+}
+
+/// Per-creator withdrawal rate-limit state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalLimits {
+    /// Maximum amount withdrawable within a 24-hour window (0 = unlimited).
+    pub daily_limit: i128,
+    /// Minimum seconds that must elapse between withdrawals (0 = no cooldown).
+    pub cooldown_seconds: u64,
+    /// Ledger timestamp of the last successful withdrawal.
+    pub last_withdrawal: u64,
+    /// Amount already withdrawn in the current 24-hour window.
+    pub withdrawn_today: i128,
+    /// Ledger timestamp when the current 24-hour window started.
+    pub day_start: u64,
+}
+
 /// A single recipient in a split tip, with share in basis points (10 000 = 100%).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -563,6 +597,7 @@ impl TipJarContract {
 
     /// Withdraws the full escrowed balance for `creator` in `token`.
     ///
+    /// Enforces per-creator (or default) daily limits and cooldown periods.
     /// Emits `("withdraw", creator)` with data `amount`.
     pub fn withdraw(env: Env, creator: Address, token: Address) {
         Self::require_not_paused(&env);
@@ -573,6 +608,7 @@ impl TipJarContract {
         if amount == 0 {
             panic_with_error!(&env, TipJarError::NothingToWithdraw);
         }
+        Self::check_and_update_withdrawal_limits(&env, &creator, amount);
         env.storage().persistent().set(&bal_key, &0i128);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &creator, &amount);
         events::emit_withdraw_event(&env, &creator, amount, &token);
