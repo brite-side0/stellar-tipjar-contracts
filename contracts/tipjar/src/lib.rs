@@ -46,6 +46,9 @@ pub mod privacy_tip;
 // Options trading
 pub mod options;
 
+// Tip inheritance mechanism
+pub mod inheritance;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
