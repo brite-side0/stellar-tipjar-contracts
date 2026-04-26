@@ -292,6 +292,33 @@ pub struct Subscription {
     pub status: SubscriptionStatus,
 }
 
+/// Stream status.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamStatus {
+    Active,
+    Paused,
+    Cancelled,
+    Completed,
+}
+
+/// A continuous tip stream where funds flow in real-time based on time elapsed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Stream {
+    pub stream_id: u64,
+    pub sender: Address,
+    pub creator: Address,
+    pub token: Address,
+    pub amount_per_second: i128,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub withdrawn: i128,
+    pub status: StreamStatus,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 /// A time-locked tip that can only be withdrawn after `unlock_time`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -454,6 +481,14 @@ pub enum DataKey {
     CreatorVestingList(Address),
     /// Global vesting schedule counter.
     VestingScheduleCounter,
+    /// Stream record keyed by stream ID.
+    Stream(u64),
+    /// List of stream IDs for a creator.
+    CreatorStreams(Address),
+    /// List of stream IDs for a sender.
+    SenderStreams(Address),
+    /// Global stream counter.
+    StreamCounter,
     /// Time-lock record keyed by lock ID.
     TimeLock(u64),
     /// Multi-sig withdrawal request keyed by request ID.
@@ -568,6 +603,22 @@ pub enum TipJarError {
     PrivateTipNotFound = 52,
     /// Invalid reveal - hash mismatch.
     InvalidReveal = 53,
+    /// Stream not found.
+    StreamNotFound = 54,
+    /// Stream has already been cancelled.
+    StreamAlreadyCancelled = 55,
+    /// Stream has not started yet.
+    StreamNotStarted = 56,
+    /// Stream has already completed.
+    StreamAlreadyCompleted = 57,
+    /// Invalid stream amount.
+    InvalidStreamAmount = 58,
+    /// Invalid stream rate (amount per second).
+    InvalidStreamRate = 59,
+    /// No streamed amount available to withdraw.
+    NoStreamedAmount = 60,
+    /// Stream rate exceeds maximum allowed (1000 tokens/second).
+    StreamRateExceedsMaximum = 61,
 }
 
 #[contract]
@@ -3190,5 +3241,374 @@ impl TipJarContract {
         env.storage()
             .persistent()
             .get(&DataKey::PrivateTipAmount(tip_id))
+    }
+
+    // ── streaming protocol ──────────────────────────────────────────────────────
+
+    /// Creates a new stream from `sender` to `creator`.
+    ///
+    /// The stream will continuously transfer funds at `amount_per_second` until
+    /// it is stopped, cancelled, or reaches its end time.
+    ///
+    /// Emits `("stream_created",)` with data `(stream_id, sender, creator, amount_per_second, duration)`.
+    pub fn create_stream(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount_per_second: i128,
+        duration: u64,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+
+        if amount_per_second <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidStreamRate);
+        }
+
+        // Maximum rate: 1000 tokens/second (adjust as needed)
+        if amount_per_second > 1000 {
+            panic_with_error!(&env, TipJarError::StreamRateExceedsMaximum);
+        }
+
+        if duration == 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        let stream_id: u64 = env.storage().instance().get(&DataKey::StreamCounter).unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let total_amount = amount_per_second * duration as i128;
+
+        let stream = Stream {
+            stream_id,
+            sender: sender.clone(),
+            creator: creator.clone(),
+            token: token.clone(),
+            amount_per_second,
+            start_time: now,
+            end_time: now + duration,
+            withdrawn: 0,
+            status: StreamStatus::Active,
+            created_at: now,
+            updated_at: now,
+        };
+
+        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+        env.storage().instance().set(&DataKey::StreamCounter, &(stream_id + 1));
+
+        // Add to sender's stream list
+        let mut sender_streams: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SenderStreams(sender.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        sender_streams.push_back(stream_id);
+        env.storage().persistent().set(&DataKey::SenderStreams(sender.clone()), &sender_streams);
+
+        // Add to creator's stream list
+        let mut creator_streams: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorStreams(creator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        creator_streams.push_back(stream_id);
+        env.storage().persistent().set(&DataKey::CreatorStreams(creator.clone()), &creator_streams);
+
+        // Transfer total amount into escrow
+        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &total_amount);
+
+        env.events().publish(
+            (symbol_short!("stream_created"),),
+            (stream_id, sender, creator, amount_per_second, duration),
+        );
+
+        stream_id
+    }
+
+    /// Calculates the amount that has been streamed up to the current time for a given stream.
+    fn calculate_streamed_amount(env: &Env, stream: &Stream) -> i128 {
+        let current_time = env.ledger().timestamp();
+
+        if stream.status != StreamStatus::Active && stream.status != StreamStatus::Paused {
+            return stream.withdrawn;
+        }
+
+        let elapsed = if current_time < stream.start_time {
+            0
+        } else if current_time > stream.end_time {
+            stream.end_time - stream.start_time
+        } else {
+            current_time - stream.start_time
+        };
+
+        (stream.amount_per_second * elapsed as i128).min(
+            stream.amount_per_second * (stream.end_time - stream.start_time) as i128
+        )
+    }
+
+    /// Starts a stream (or resumes a paused stream).
+    ///
+    /// Only the sender can start/activate a stream.
+    /// Emits `("stream_started",)` with data `(stream_id)`.
+    pub fn start_stream(env: Env, sender: Address, stream_id: u64) {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+
+        if stream.sender != sender {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        if stream.status == StreamStatus::Cancelled {
+            panic_with_error!(&env, TipJarError::StreamAlreadyCancelled);
+        }
+
+        if stream.status == StreamStatus::Completed {
+            panic_with_error!(&env, TipJarError::StreamAlreadyCompleted);
+        }
+
+        let now = env.ledger().timestamp();
+
+        // If starting from scratch, set start_time
+        if stream.status == StreamStatus::Paused {
+            // Resume from paused state
+            let pause_duration = now - stream.updated_at;
+            stream.start_time += pause_duration;
+            stream.end_time += pause_duration;
+        }
+
+        stream.status = StreamStatus::Active;
+        stream.updated_at = now;
+
+        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+
+        env.events().publish(
+            (symbol_short!("stream_started"),),
+            stream_id,
+        );
+    }
+
+    /// Stops (pauses) an active stream.
+    ///
+    /// Only the sender can stop a stream.
+    /// Emits `("stream_stopped",)` with data `(stream_id, streamed_amount)`.
+    pub fn stop_stream(env: Env, sender: Address, stream_id: u64) {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+
+        if stream.sender != sender {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        if stream.status != StreamStatus::Active {
+            panic_with_error!(&env, TipJarError::StreamNotStarted);
+        }
+
+        if stream.status == StreamStatus::Cancelled {
+            panic_with_error!(&env, TipJarError::StreamAlreadyCancelled);
+        }
+
+        let streamed_amount = Self::calculate_streamed_amount(&env, &stream);
+        stream.status = StreamStatus::Paused;
+        stream.withdrawn = streamed_amount;
+        stream.updated_at = env.ledger().timestamp();
+
+        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+
+        env.events().publish(
+            (symbol_short!("stream_stopped"),),
+            (stream_id, streamed_amount),
+        );
+    }
+
+    /// Withdraws the currently streamed amount for a stream.
+    ///
+    /// The creator can withdraw the amount that has been streamed up to now.
+    /// Emits `("stream_withdrawn",)` with data `(stream_id, amount, creator)`.
+    pub fn withdraw_streamed(env: Env, creator: Address, stream_id: u64) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+
+        if stream.creator != creator {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        if stream.status == StreamStatus::Cancelled {
+            panic_with_error!(&env, TipJarError::StreamAlreadyCancelled);
+        }
+
+        let current_time = env.ledger().timestamp();
+
+        if current_time < stream.start_time {
+            panic_with_error!(&env, TipJarError::StreamNotStarted);
+        }
+
+        let total_streamable = stream.amount_per_second * (stream.end_time - stream.start_time) as i128;
+        let streamed_amount = Self::calculate_streamed_amount(&env, &stream);
+        let available_to_withdraw = streamed_amount - stream.withdrawn;
+
+        if available_to_withdraw <= 0 {
+            panic_with_error!(&env, TipJarError::NoStreamedAmount);
+        }
+
+        // Update stream state BEFORE external call
+        stream.withdrawn = streamed_amount;
+
+        // Check if stream is completed
+        if current_time >= stream.end_time {
+            stream.status = StreamStatus::Completed;
+        }
+
+        stream.updated_at = current_time;
+
+        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+
+        // Transfer tokens to creator
+        token::Client::new(&env, &stream.token).transfer(
+            &env.current_contract_address(),
+            &creator,
+            &available_to_withdraw,
+        );
+
+        env.events().publish(
+            (symbol_short!("stream_withdrawn"),),
+            (stream_id, available_to_withdraw, creator),
+        );
+    }
+
+    /// Cancels an active stream and refunds the remaining tokens to the sender.
+    ///
+    /// Only the sender can cancel a stream.
+    /// Emits `("stream_cancelled",)` with data `(stream_id, refunded_amount)`.
+    pub fn cancel_stream(env: Env, sender: Address, stream_id: u64) {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+
+        if stream.sender != sender {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        if stream.status == StreamStatus::Cancelled {
+            panic_with_error!(&env, TipJarError::StreamAlreadyCancelled);
+        }
+
+        if stream.status == StreamStatus::Completed {
+            panic_with_error!(&env, TipJarError::StreamAlreadyCompleted);
+        }
+
+        let current_time = env.ledger().timestamp();
+        let streamed_amount = Self::calculate_streamed_amount(&env, &stream);
+
+        // Calculate total amount that was put into escrow
+        let total_amount = stream.amount_per_second * (stream.end_time - stream.start_time) as i128;
+        let remaining_amount = total_amount - streamed_amount;
+
+        // Mark stream as cancelled
+        stream.status = StreamStatus::Cancelled;
+        stream.updated_at = current_time;
+
+        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+
+        // Refund remaining tokens to sender
+        if remaining_amount > 0 {
+            token::Client::new(&env, &stream.token).transfer(
+                &env.current_contract_address(),
+                &sender,
+                &remaining_amount,
+            );
+        }
+
+        // If there's any withdrawn amount not yet claimed, it's already in the creator's balance
+        // (handled by the periodic withdraw_streamed calls)
+
+        env.events().publish(
+            (symbol_short!("stream_cancelled"),),
+            (stream_id, remaining_amount),
+        );
+    }
+
+    /// Returns the current stream details.
+    pub fn get_stream(env: Env, stream_id: u64) -> Option<Stream> {
+        env.storage().persistent().get(&DataKey::Stream(stream_id))
+    }
+
+    /// Returns all stream IDs for a creator.
+    pub fn get_streams_by_creator(env: Env, creator: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CreatorStreams(creator))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns all stream IDs for a sender.
+    pub fn get_streams_by_sender(env: Env, sender: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SenderStreams(sender))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the current streamed amount for a stream.
+    pub fn get_streamed_amount(env: Env, stream_id: u64) -> i128 {
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+
+        Self::calculate_streamed_amount(&env, &stream)
+    }
+
+    /// Returns the available amount to withdraw for a stream.
+    pub fn get_available_to_withdraw(env: Env, stream_id: u64) -> i128 {
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+
+        if stream.status == StreamStatus::Cancelled || stream.status == StreamStatus::Completed {
+            return 0;
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time < stream.start_time {
+            return 0;
+        }
+
+        let streamed_amount = Self::calculate_streamed_amount(&env, &stream);
+        streamed_amount - stream.withdrawn
     }
 }
