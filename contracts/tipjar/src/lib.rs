@@ -43,6 +43,9 @@ pub mod dispute;
 // Privacy features
 pub mod privacy_tip;
 
+// Collateralization mechanism
+pub mod collateral;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -645,6 +648,21 @@ pub enum DataKey {
     InsAdmin,
     /// List of claim IDs for a creator per token.
     InsClms(Address, Address),
+    // ── Collateral keys (delegated to collateral::CollateralKey) ────────────
+    /// Collateral ratio config keyed by token address.
+    CollateralRatio(Address),
+    /// Collateral position keyed by (depositor, token).
+    CollateralPosition(Address, Address),
+    /// List of token addresses a depositor has active collateral positions in.
+    CollateralDepositorTokens(Address),
+    /// Liquidation record keyed by liquidation ID.
+    LiquidationRecord(u64),
+    /// Global liquidation counter.
+    LiquidationCounter,
+    /// Total collateral locked per token.
+    TotalCollateral(Address),
+    /// Total debt outstanding per token.
+    TotalDebt(Address),
 }
 
 #[contracterror]
@@ -801,6 +819,21 @@ pub enum TipJarError {
     InvalidReservePrice = 85,
     /// Auction has already ended and can no longer accept bids.
     AuctionEnded = 86,
+    // ── Collateral errors ────────────────────────────────────────────────────
+    /// Collateral ratio parameters are invalid (out of range or inconsistent).
+    InvalidCollateralRatio = 87,
+    /// The token is not enabled as accepted collateral.
+    CollateralTokenNotEnabled = 88,
+    /// No collateral position found for this depositor/token pair.
+    CollateralPositionNotFound = 89,
+    /// The collateral position has already been liquidated.
+    CollateralPositionLiquidated = 90,
+    /// Collateral amount is insufficient to cover the requested borrow or release.
+    InsufficientCollateral = 91,
+    /// Repayment amount exceeds the outstanding debt.
+    RepayExceedsDebt = 92,
+    /// The collateral position is healthy and cannot be liquidated.
+    CollateralPositionHealthy = 93,
 }
 
 #[contract]
@@ -5191,6 +5224,210 @@ impl TipJarContract {
             .instance()
             .get(&DataKey::BridgeEnabled)
             .unwrap_or(false)
+    }
+
+    // ── collateralization ────────────────────────────────────────────────────
+
+    /// Configures the collateral ratio for a token. Admin only.
+    ///
+    /// - `ratio_bps`: minimum collateral ratio in basis points (e.g. 15 000 = 150%).
+    ///   Must be between 11 000 (110%) and 50 000 (500%).
+    /// - `liquidation_threshold_bps`: health-factor threshold below which a
+    ///   position becomes liquidatable (must be < `ratio_bps` and ≥ 10 000).
+    /// - `liquidation_penalty_bps`: bonus paid to liquidators (max 5 000 = 50%).
+    ///
+    /// Emits `("col_ratio",)` with data `(token, ratio_bps, liquidation_threshold_bps)`.
+    pub fn set_collateral_ratio(
+        env: Env,
+        admin: Address,
+        token: Address,
+        ratio_bps: u32,
+        liquidation_threshold_bps: u32,
+        liquidation_penalty_bps: u32,
+    ) {
+        Self::require_not_paused(&env);
+        collateral::ratios::set_collateral_ratio(
+            &env,
+            &admin,
+            &token,
+            ratio_bps,
+            liquidation_threshold_bps,
+            liquidation_penalty_bps,
+        );
+    }
+
+    /// Enables or disables a token as accepted collateral. Admin only.
+    ///
+    /// Emits `("col_enbl",)` with data `(token, enabled)`.
+    pub fn set_collateral_enabled(env: Env, admin: Address, token: Address, enabled: bool) {
+        Self::require_not_paused(&env);
+        collateral::ratios::set_collateral_enabled(&env, &admin, &token, enabled);
+    }
+
+    /// Returns the collateral ratio configuration for `token`.
+    pub fn get_collateral_ratio(
+        env: Env,
+        token: Address,
+    ) -> collateral::CollateralRatio {
+        collateral::ratios::get_collateral_ratio(&env, &token)
+    }
+
+    /// Returns the maximum amount borrowable against `collateral_amount` of `token`.
+    pub fn max_borrowable(env: Env, token: Address, collateral_amount: i128) -> i128 {
+        collateral::ratios::max_borrowable(&env, &token, collateral_amount)
+    }
+
+    /// Locks `amount` of `collateral_token` as collateral.
+    ///
+    /// Transfers tokens from `depositor` into the contract. Creates a new
+    /// position or adds to an existing one.
+    ///
+    /// Emits `("col_lock",)` with data `(depositor, token, amount, new_total)`.
+    pub fn lock_collateral(
+        env: Env,
+        depositor: Address,
+        collateral_token: Address,
+        amount: i128,
+    ) {
+        Self::require_not_paused(&env);
+        collateral::positions::lock_collateral(&env, &depositor, &collateral_token, amount);
+    }
+
+    /// Borrows `borrow_amount` against an existing collateral position.
+    ///
+    /// Transfers borrowed tokens from the contract to `depositor`.
+    ///
+    /// Emits `("col_borr",)` with data `(depositor, token, borrow_amount, new_debt)`.
+    pub fn borrow_against_collateral(
+        env: Env,
+        depositor: Address,
+        collateral_token: Address,
+        borrow_amount: i128,
+    ) {
+        Self::require_not_paused(&env);
+        collateral::positions::borrow_against_collateral(
+            &env,
+            &depositor,
+            &collateral_token,
+            borrow_amount,
+        );
+    }
+
+    /// Repays `repay_amount` of debt for a collateral position.
+    ///
+    /// `repayer` may be the depositor themselves or a third party.
+    /// Transfers tokens from `repayer` into the contract.
+    ///
+    /// Emits `("col_repay",)` with data `(depositor, token, repay_amount, remaining_debt)`.
+    pub fn repay_collateral_debt(
+        env: Env,
+        repayer: Address,
+        depositor: Address,
+        collateral_token: Address,
+        repay_amount: i128,
+    ) {
+        Self::require_not_paused(&env);
+        collateral::positions::repay_debt(
+            &env,
+            &repayer,
+            &depositor,
+            &collateral_token,
+            repay_amount,
+        );
+    }
+
+    /// Releases `release_amount` of collateral back to `depositor`.
+    ///
+    /// Only succeeds when the remaining collateral still satisfies the
+    /// required ratio against outstanding debt.
+    ///
+    /// Emits `("col_rels",)` with data `(depositor, token, release_amount, remaining_collateral)`.
+    pub fn release_collateral(
+        env: Env,
+        depositor: Address,
+        collateral_token: Address,
+        release_amount: i128,
+    ) {
+        Self::require_not_paused(&env);
+        collateral::positions::release_collateral(
+            &env,
+            &depositor,
+            &collateral_token,
+            release_amount,
+        );
+    }
+
+    /// Returns the collateral position for `(depositor, collateral_token)`.
+    pub fn get_collateral_position(
+        env: Env,
+        depositor: Address,
+        collateral_token: Address,
+    ) -> Option<collateral::CollateralPosition> {
+        collateral::positions::get_position(&env, &depositor, &collateral_token)
+    }
+
+    /// Returns the health factor of a position scaled by 1 000 000.
+    ///
+    /// A value ≥ 1 000 000 means the position is healthy.
+    /// Returns `i128::MAX` when there is no debt.
+    pub fn collateral_health_factor(
+        env: Env,
+        depositor: Address,
+        collateral_token: Address,
+    ) -> i128 {
+        collateral::positions::health_factor(&env, &depositor, &collateral_token)
+    }
+
+    /// Returns all token addresses for which `depositor` has collateral positions.
+    pub fn get_collateral_tokens(env: Env, depositor: Address) -> Vec<Address> {
+        collateral::positions::get_depositor_tokens(&env, &depositor)
+    }
+
+    /// Returns the total collateral locked for `token` across all positions.
+    pub fn total_collateral(env: Env, token: Address) -> i128 {
+        collateral::positions::get_total_collateral(&env, &token)
+    }
+
+    /// Returns the total outstanding debt for `token` across all positions.
+    pub fn total_collateral_debt(env: Env, token: Address) -> i128 {
+        collateral::positions::get_total_debt(&env, &token)
+    }
+
+    /// Liquidates an under-collateralised position.
+    ///
+    /// The liquidator repays `repay_amount` of the borrower's debt and receives
+    /// the equivalent collateral plus a penalty bonus.
+    ///
+    /// Emits `("col_liq",)` with data
+    /// `(depositor, liquidator, token, collateral_seized, debt_repaid, penalty)`.
+    pub fn liquidate_collateral(
+        env: Env,
+        liquidator: Address,
+        depositor: Address,
+        collateral_token: Address,
+        repay_amount: i128,
+    ) {
+        Self::require_not_paused(&env);
+        collateral::liquidation::liquidate(
+            &env,
+            &liquidator,
+            &depositor,
+            &collateral_token,
+            repay_amount,
+        );
+    }
+
+    /// Returns a liquidation record by ID, or `None` if not found.
+    pub fn get_liquidation_record(
+        env: Env,
+        liquidation_id: u64,
+    ) -> Option<collateral::LiquidationRecord> {
+        collateral::liquidation::get_liquidation_record(&env, liquidation_id)
+    }
+
+    /// Returns the total number of liquidations recorded.
+    pub fn liquidation_count(env: Env) -> u64 {
+        collateral::liquidation::liquidation_count(&env)
     }
 }
 
