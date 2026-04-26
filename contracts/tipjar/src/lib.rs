@@ -46,6 +46,9 @@ pub mod privacy_tip;
 // Options trading
 pub mod options;
 
+// Royalty system for derivative content
+pub mod royalty;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -672,6 +675,14 @@ pub enum DataKey {
     BridgeEnabled,
     /// Bridge fee in basis points.
     BridgeFeeBps,
+    /// Royalty configuration for a creator's content.
+    RoyaltyConfig(Address),
+    /// Content lineage for a creator (parent link).
+    ContentLineage(Address),
+    /// Accumulated royalties for a creator per token.
+    RoyaltyBalance(Address, Address),
+    /// Subscription tier configuration keyed by tier.
+    TierConfig(SubscriptionTier),
 }
 
 #[contracterror]
@@ -850,6 +861,24 @@ pub enum TipJarError {
     OptionNotExpired = 96,
     /// Invalid bridge fee.
     InvalidBridgeFee = 97,
+    /// Royalty rate exceeds maximum allowed (3000 bps).
+    RoyaltyRateTooHigh = 98,
+    /// No royalties available to withdraw.
+    NoRoyaltiesToWithdraw = 99,
+    /// Royalty config not found for creator.
+    RoyaltyConfigNotFound = 100,
+    /// Vesting duration must be greater than zero.
+    InvalidVestingDuration = 101,
+    /// Cliff duration exceeds vesting duration.
+    CliffExceedsVesting = 102,
+    /// Vesting schedule ID is invalid (zero).
+    InvalidVestingId = 103,
+    /// Vesting schedule not found.
+    VestingScheduleNotFound = 104,
+    /// No vested amount available to withdraw.
+    NoVestedAmount = 105,
+    /// Subscription tier is not configured.
+    TierNotConfigured = 106,
 }
 
 #[contract]
@@ -5612,5 +5641,138 @@ impl TipJarContract {
         );
 
         expired_count
+    }
+
+    // ── royalty system ───────────────────────────────────────────────────────
+
+    /// Registers a royalty configuration for derivative content.
+    ///
+    /// `creator` is the derivative content creator; `original_creator` receives
+    /// `rate_bps` basis points of every tip sent to `creator`.
+    /// `max_depth` caps multi-level traversal (1–5; 0 defaults to 5).
+    ///
+    /// Emits `("roy_reg",)` with data `(creator, original_creator, rate_bps)`.
+    pub fn register_royalty(
+        env: Env,
+        creator: Address,
+        original_creator: Address,
+        rate_bps: u32,
+        max_depth: u32,
+    ) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+        if rate_bps == 0 || rate_bps > royalty::MAX_ROYALTY_BPS {
+            panic_with_error!(&env, TipJarError::RoyaltyRateTooHigh);
+        }
+        royalty::register_royalty(&env, &creator, &original_creator, rate_bps, max_depth);
+        env.events().publish(
+            (symbol_short!("roy_reg"),),
+            (creator, original_creator, rate_bps),
+        );
+    }
+
+    /// Sends a tip to `creator` and automatically distributes royalties up the
+    /// content lineage chain before crediting the creator's balance.
+    ///
+    /// Emits `("tip", creator)` with data `(sender, net_amount)` and
+    /// `("royalty",)` for each royalty payment.
+    pub fn tip_with_royalty(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let fee: i128 = (amount * fee_bp as i128) / 10_000;
+        let after_fee = amount - fee;
+
+        // Distribute royalties; returns net amount for creator.
+        let net = royalty::distribute_royalties(&env, &creator, &token, after_fee);
+
+        if fee > 0 {
+            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let current_fee: i128 = env.storage().instance().get(&fee_key).unwrap_or(0);
+            env.storage().instance().set(&fee_key, &(current_fee + fee));
+        }
+
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let existing_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        env.storage().persistent().set(&bal_key, &(existing_bal + net));
+
+        let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
+        let existing_tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
+        env.storage().persistent().set(&tot_key, &(existing_tot + net));
+
+        let tip_id: u64 = env.storage().instance().get(&DataKey::TipCounter).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TipCounter, &(tip_id + 1));
+
+        Self::update_leaderboard_stats(&env, &sender, &creator, net);
+        Self::track_creator_token(&env, &creator, &token);
+
+        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+
+        env.events().publish((symbol_short!("tip"), creator.clone()), (sender, net));
+        tip_id
+    }
+
+    /// Withdraws accumulated royalties for `creator` in `token`.
+    ///
+    /// Emits `("roy_wdr",)` with data `(creator, token, amount)`.
+    pub fn withdraw_royalties(env: Env, creator: Address, token: Address) -> i128 {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+        let bal_key = DataKey::RoyaltyBalance(creator.clone(), token.clone());
+        let amount: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        if amount == 0 {
+            panic_with_error!(&env, TipJarError::NoRoyaltiesToWithdraw);
+        }
+        env.storage().persistent().set(&bal_key, &0i128);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &creator,
+            &amount,
+        );
+        env.events().publish(
+            (symbol_short!("roy_wdr"),),
+            (creator, token, amount),
+        );
+        amount
+    }
+
+    /// Returns the accumulated royalty balance for `creator` in `token`.
+    pub fn get_royalty_balance(env: Env, creator: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoyaltyBalance(creator, token))
+            .unwrap_or(0)
+    }
+
+    /// Returns the royalty configuration for `creator`, if registered.
+    pub fn get_royalty_config(env: Env, creator: Address) -> Option<royalty::RoyaltyConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoyaltyConfig(creator))
+    }
+
+    /// Returns the content lineage for `creator`, if registered.
+    pub fn get_content_lineage(env: Env, creator: Address) -> Option<royalty::ContentLineage> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ContentLineage(creator))
     }
 }
