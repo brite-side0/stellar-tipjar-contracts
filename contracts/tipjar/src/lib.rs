@@ -49,6 +49,9 @@ pub mod options;
 // Tip Index Funds
 pub mod index_fund;
 
+// Bonding curves
+pub mod bonding_curve;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4195,6 +4198,116 @@ impl TipJarContract {
     /// Returns the pending (not yet vested) rewards for a provider in a program.
     pub fn lm_get_pending_rewards(env: Env, provider: Address, program_id: u64) -> i128 {
         liquidity_mining::get_pending_rewards(&env, &provider, program_id)
+    }
+
+    // ── bonding curves ────────────────────────────────────────────────────────
+
+    /// Creates a new bonding curve for dynamic tip token pricing.
+    ///
+    /// * `params`           — curve type, pricing parameters, and fees.
+    /// * `initial_reserve`  — optional seed collateral transferred from `creator` (pass 0 for none).
+    ///
+    /// Returns the new curve ID.
+    /// Emits `("bc_create",)` with `(curve_id, creator, tip_token, reserve_token)`.
+    pub fn bc_create_curve(
+        env: Env,
+        creator: Address,
+        tip_token: Address,
+        reserve_token: Address,
+        params: bonding_curve::CurveParams,
+        initial_reserve: i128,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        bonding_curve::create_curve(
+            &env,
+            &creator,
+            &tip_token,
+            &reserve_token,
+            params,
+            initial_reserve,
+        )
+    }
+
+    /// Buys `token_amount` tip tokens from a bonding curve.
+    ///
+    /// Collateral is calculated by integrating the price curve.
+    /// The transaction reverts if the total cost exceeds `max_collateral`.
+    ///
+    /// Emits `("bc_buy",)` with `(buyer, curve_id, token_amount, collateral_paid, new_price)`.
+    pub fn bc_buy(
+        env: Env,
+        buyer: Address,
+        curve_id: u64,
+        token_amount: i128,
+        max_collateral: i128,
+    ) -> bonding_curve::TradeResult {
+        Self::require_not_paused(&env);
+        bonding_curve::buy(&env, &buyer, curve_id, token_amount, max_collateral)
+    }
+
+    /// Sells `token_amount` tip tokens back to a bonding curve.
+    ///
+    /// Collateral returned is calculated by integrating the price curve.
+    /// The transaction reverts if the net return is below `min_collateral`.
+    ///
+    /// Emits `("bc_sell",)` with `(seller, curve_id, token_amount, collateral_returned, new_price)`.
+    pub fn bc_sell(
+        env: Env,
+        seller: Address,
+        curve_id: u64,
+        token_amount: i128,
+        min_collateral: i128,
+    ) -> bonding_curve::TradeResult {
+        Self::require_not_paused(&env);
+        bonding_curve::sell(&env, &seller, curve_id, token_amount, min_collateral)
+    }
+
+    /// Updates the buy and sell fee parameters of a curve.
+    /// Only the curve creator can call this.
+    ///
+    /// Emits `("bc_fee",)` with `(curve_id, buy_fee_bps, sell_fee_bps)`.
+    pub fn bc_update_fees(
+        env: Env,
+        creator: Address,
+        curve_id: u64,
+        buy_fee_bps: u32,
+        sell_fee_bps: u32,
+    ) {
+        Self::require_not_paused(&env);
+        bonding_curve::update_fees(&env, &creator, curve_id, buy_fee_bps, sell_fee_bps);
+    }
+
+    /// Withdraws accumulated fees to the curve creator.
+    /// Returns the amount withdrawn.
+    ///
+    /// Emits `("bc_wfee",)` with `(curve_id, creator, amount)`.
+    pub fn bc_withdraw_fees(env: Env, creator: Address, curve_id: u64) -> i128 {
+        Self::require_not_paused(&env);
+        bonding_curve::withdraw_fees(&env, &creator, curve_id)
+    }
+
+    /// Deactivates a bonding curve. Only the creator can call this.
+    ///
+    /// Emits `("bc_deact",)` with `(curve_id,)`.
+    pub fn bc_deactivate(env: Env, creator: Address, curve_id: u64) {
+        Self::require_not_paused(&env);
+        bonding_curve::deactivate_curve(&env, &creator, curve_id);
+    }
+
+    /// Returns a price quote for buying or selling `amount` tokens without
+    /// executing any trade.
+    pub fn bc_get_quote(env: Env, curve_id: u64, amount: i128) -> bonding_curve::PriceQuote {
+        bonding_curve::get_quote(&env, curve_id, amount)
+    }
+
+    /// Returns the current spot price for a bonding curve (× PRECISION).
+    pub fn bc_get_spot_price(env: Env, curve_id: u64) -> i128 {
+        bonding_curve::get_spot_price(&env, curve_id)
+    }
+
+    /// Returns a bonding curve's full configuration and state.
+    pub fn bc_get_curve(env: Env, curve_id: u64) -> bonding_curve::BondingCurve {
+        bonding_curve::get_curve_info(&env, curve_id)
     }
 
     /// Checks and awards milestones when a creator reaches specific tip thresholds.
