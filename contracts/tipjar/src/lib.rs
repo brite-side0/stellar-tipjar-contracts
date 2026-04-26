@@ -340,6 +340,25 @@ pub enum SubscriptionStatus {
     Cancelled,
 }
 
+/// Subscription tier level.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubscriptionTier {
+    Bronze,
+    Silver,
+    Gold,
+}
+
+/// Configuration for a subscription tier set by admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TierConfig {
+    /// Price per payment interval in token units.
+    pub price: i128,
+    /// Human-readable description of benefits for this tier.
+    pub benefits: String,
+}
+
 /// A recurring tip subscription from a subscriber to a creator.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -353,6 +372,10 @@ pub struct Subscription {
     pub last_payment: u64,
     pub next_payment: u64,
     pub status: SubscriptionStatus,
+    /// The tier this subscription is on.
+    pub tier: SubscriptionTier,
+    /// Pending tier change to apply at next payment cycle (None = no pending change).
+    pub pending_tier: Option<SubscriptionTier>,
 }
 
 /// Stream status.
@@ -1676,8 +1699,52 @@ impl TipJarContract {
         upgrade::get_version(&env)
     }
 
-    /// Creates a recurring tip subscription from `subscriber` to `creator`.
+    /// Sets the configuration for a subscription tier. Admin only.
     ///
+    /// `price` is the amount charged per payment interval.
+    /// `benefits` is a human-readable description of what the tier provides.
+    /// Emits `("tier_set",)` with data `(tier, price)`.
+    pub fn set_tier_config(
+        env: Env,
+        admin: Address,
+        tier: SubscriptionTier,
+        price: i128,
+        benefits: String,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if price <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        let config = TierConfig { price, benefits };
+        env.storage()
+            .persistent()
+            .set(&DataKey::TierConfig(tier.clone()), &config);
+        env.events()
+            .publish((symbol_short!("tier_set"),), (tier, price));
+    }
+
+    /// Returns the configuration for a tier, or `None` if not configured.
+    pub fn get_tier_config(env: Env, tier: SubscriptionTier) -> Option<TierConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TierConfig(tier))
+    }
+
+    /// Returns the benefits description for a tier, or `None` if not configured.
+    pub fn get_tier_benefits(env: Env, tier: SubscriptionTier) -> Option<String> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, TierConfig>(&DataKey::TierConfig(tier))
+            .map(|c| c.benefits)
+    }
+
+    /// Creates a recurring tip subscription from `subscriber` to `creator` at the given tier.
+    ///
+    /// The tier must be configured via `set_tier_config` first.
     /// The first payment becomes due immediately (at creation time).
     /// Minimum interval is 1 day (86 400 seconds).
     ///
@@ -1709,6 +1776,8 @@ impl TipJarContract {
             last_payment: 0,
             next_payment: now,
             status: SubscriptionStatus::Active,
+            tier: SubscriptionTier::Bronze,
+            pending_tier: None,
         };
         env.storage()
             .persistent()
@@ -1719,9 +1788,149 @@ impl TipJarContract {
         );
     }
 
+    /// Creates a tiered subscription from `subscriber` to `creator`.
+    ///
+    /// The tier must be configured via `set_tier_config`. The price from the tier
+    /// config is used as the payment amount.
+    /// Minimum interval is 1 day (86 400 seconds).
+    ///
+    /// Emits `("sub_new", creator)` with data `(subscriber, amount, interval_seconds)`.
+    pub fn create_tiered_subscription(
+        env: Env,
+        subscriber: Address,
+        creator: Address,
+        token: Address,
+        tier: SubscriptionTier,
+        interval_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        subscriber.require_auth();
+        let config: TierConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TierConfig(tier.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::TierNotConfigured));
+        const MIN_INTERVAL: u64 = 86_400;
+        if interval_seconds < MIN_INTERVAL {
+            panic_with_error!(&env, TipJarError::InvalidInterval);
+        }
+        let now = env.ledger().timestamp();
+        let amount = config.price;
+        let sub = Subscription {
+            subscriber: subscriber.clone(),
+            creator: creator.clone(),
+            token,
+            amount,
+            interval_seconds,
+            last_payment: 0,
+            next_payment: now,
+            status: SubscriptionStatus::Active,
+            tier: tier.clone(),
+            pending_tier: None,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscriber.clone(), creator.clone()), &sub);
+        env.events().publish(
+            (symbol_short!("sub_new"), creator),
+            (subscriber, amount, interval_seconds),
+        );
+    }
+
+    /// Upgrades an active subscription to a higher tier immediately.
+    ///
+    /// Executes an immediate payment at the new tier's price and updates the
+    /// subscription amount for future payments.
+    /// Emits `("sub_upgr", creator)` with data `(subscriber, new_tier_price)`.
+    pub fn upgrade_subscription(
+        env: Env,
+        subscriber: Address,
+        creator: Address,
+        new_tier: SubscriptionTier,
+    ) {
+        Self::require_not_paused(&env);
+        subscriber.require_auth();
+        let key = DataKey::Subscription(subscriber.clone(), creator.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::SubscriptionNotFound));
+        if sub.status != SubscriptionStatus::Active {
+            panic_with_error!(&env, TipJarError::SubscriptionNotActive);
+        }
+        let config: TierConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TierConfig(new_tier.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::TierNotConfigured));
+
+        // Execute immediate payment at new tier price.
+        token::Client::new(&env, &sub.token).transfer(
+            &subscriber,
+            &env.current_contract_address(),
+            &config.price,
+        );
+        let bal_key = DataKey::CreatorBalance(creator.clone(), sub.token.clone());
+        let bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        env.storage().persistent().set(&bal_key, &(bal + config.price));
+        let tot_key = DataKey::CreatorTotal(creator.clone(), sub.token.clone());
+        let tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
+        env.storage().persistent().set(&tot_key, &(tot + config.price));
+
+        let now = env.ledger().timestamp();
+        sub.tier = new_tier;
+        sub.amount = config.price;
+        sub.last_payment = now;
+        sub.next_payment = now + sub.interval_seconds;
+        sub.pending_tier = None;
+        env.storage().persistent().set(&key, &sub);
+        env.events().publish(
+            (symbol_short!("sub_upgr"), creator),
+            (subscriber, config.price),
+        );
+    }
+
+    /// Schedules a downgrade to a lower tier, effective at the next payment cycle.
+    ///
+    /// The current tier and amount remain active until `execute_subscription_payment`
+    /// is called, at which point the pending tier is applied.
+    /// Emits `("sub_dngr", creator)` with data `(subscriber, new_tier_price)`.
+    pub fn downgrade_subscription(
+        env: Env,
+        subscriber: Address,
+        creator: Address,
+        new_tier: SubscriptionTier,
+    ) {
+        Self::require_not_paused(&env);
+        subscriber.require_auth();
+        let key = DataKey::Subscription(subscriber.clone(), creator.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::SubscriptionNotFound));
+        if sub.status != SubscriptionStatus::Active {
+            panic_with_error!(&env, TipJarError::SubscriptionNotActive);
+        }
+        // Validate the target tier is configured.
+        let config: TierConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TierConfig(new_tier.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::TierNotConfigured));
+        sub.pending_tier = Some(new_tier);
+        env.storage().persistent().set(&key, &sub);
+        env.events().publish(
+            (symbol_short!("sub_dngr"), creator),
+            (subscriber, config.price),
+        );
+    }
+
     /// Executes a due subscription payment, transferring tokens from subscriber
     /// into escrow for the creator.
     ///
+    /// Applies any pending tier downgrade before charging.
     /// Anyone may call this; the subscriber's auth is pulled via `transfer`.
     /// Emits `("sub_pay", creator)` with data `(subscriber, amount)`.
     pub fn execute_subscription_payment(env: Env, subscriber: Address, creator: Address) {
@@ -1739,6 +1948,19 @@ impl TipJarContract {
         let now = env.ledger().timestamp();
         if now < sub.next_payment {
             panic_with_error!(&env, TipJarError::PaymentNotDue);
+        }
+
+        // Apply pending downgrade if present.
+        if let Some(pending) = sub.pending_tier.clone() {
+            if let Some(config) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TierConfig>(&DataKey::TierConfig(pending.clone()))
+            {
+                sub.tier = pending;
+                sub.amount = config.price;
+            }
+            sub.pending_tier = None;
         }
 
         token::Client::new(&env, &sub.token).transfer(
