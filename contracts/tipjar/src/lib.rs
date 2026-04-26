@@ -717,7 +717,7 @@ pub enum DataKey {
     InsAdmin,
     /// List of claim IDs for a creator per token.
     InsClms(Address, Address),
-a    /// Option contract by ID.
+    /// Option contract by ID.
     Option(u64),
     /// Option counter for ID generation.
     OptionCounter,
@@ -749,6 +749,12 @@ a    /// Option contract by ID.
     IndexFundShare(u64, Address),
     /// Creator allocation within a fund keyed by (fund_id, creator).
     IndexCreatorAlloc(u64, Address),
+    /// TWAP oracle config and state keyed by oracle_id.
+    TwapOracle(u64),
+    /// Individual ring-buffer observation keyed by (oracle_id, slot_index).
+    TwapObservation(u64, u32),
+    /// Global TWAP oracle ID counter.
+    TwapOracleCounter,
 }
 
 #[contracterror]
@@ -941,6 +947,18 @@ pub enum TipJarError {
     IndexDepositTooSmall = 103,
     /// Attempted to unpause a contract that is not currently paused.
     NotPaused = 104,
+    /// TWAP oracle not found.
+    TwapOracleNotFound = 105,
+    /// TWAP oracle is inactive.
+    TwapOracleInactive = 106,
+    /// TWAP price update is too frequent (below MIN_UPDATE_INTERVAL).
+    TwapUpdateTooFrequent = 107,
+    /// TWAP observation window is outside the allowed range.
+    TwapInvalidWindow = 108,
+    /// TWAP oracle parameters (e.g. capacity) are invalid.
+    TwapInvalidParams = 109,
+    /// TWAP price value is invalid (must be > 0).
+    TwapInvalidPrice = 110,
 }
 
 #[contract]
